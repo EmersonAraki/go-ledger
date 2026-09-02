@@ -44,10 +44,17 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # Installed from the version pinned in the Makefile rather than via
+      # golangci-lint-action: the action's v6 line installs golangci-lint v1,
+      # which cannot read this repo's v2-format .golangci.yml. Sharing the
+      # Makefile pin keeps CI and local runs on the same linter.
+      - name: Install golangci-lint
+        run: |
+          make lint-install
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
       - name: Lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: latest
+        run: make lint
 
       - name: Test
         env:

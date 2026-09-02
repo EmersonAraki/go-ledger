@@ -5,6 +5,12 @@
 DB_URL      ?= postgres://sumzero:sumzero@localhost:5432/sumzero?sslmode=disable
 TEST_DB_URL ?= postgres://sumzero:sumzero@localhost:5432/sumzero_test?sslmode=disable
 
+# Pinned here and used by CI too, so the linter that gates a pull request is
+# byte-for-byte the one you run locally. Bumping the `go` directive in go.mod
+# above this build's Go version makes golangci-lint refuse to start, so these
+# two move together.
+GOLANGCI_LINT_VERSION ?= v2.5.0
+
 .PHONY: help
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
@@ -50,6 +56,10 @@ test-short: ## Run tests that need no database
 .PHONY: fmt
 fmt: ## Format all Go code
 	gofmt -w .
+
+.PHONY: lint-install
+lint-install: ## Install the pinned golangci-lint version
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 .PHONY: lint
 lint: ## Run golangci-lint
