@@ -15,7 +15,9 @@ Before you begin any task or write any code, you must equip yourself with the pr
 
 ### [2. GUARDRAILS: EXECUTE THE "ONE-COMMAND GATE"]
 You must rely on objective, machine-executable validations rather than subjective assumptions:
-1. **Locate the Verification Command**: Identify the single command that runs all guardrails (e.g., `npm run check`, `pytest`, `cargo test`, `python verify.py` which bundle formatters, linters, type checkers, and tests).
+1. **The Verification Command**: For this repository the gate is **`make check`**. It bundles `gofmt`, `go vet`, `golangci-lint` (at the version pinned in the Makefile) and `go test -race ./...`. Run that one command -- not its parts.
+   - Integration tests need a real PostgreSQL. `make up` starts it; `TEST_DATABASE_URL` points the tests at it.
+   - **A bare `go test ./...` is not the gate.** With `TEST_DATABASE_URL` unset the database tests *skip* and still report `ok`, so a green `go test` can mean nothing ran. Only `make check` proves the gate.
 2. **Run validations after EVERY change**: Do not assume your code works. You must physically execute the validation command in the terminal to let the machine determine success or failure.
 3. **Definition of Done**: A task is ONLY complete when the validation command returns a success code with zero errors or warnings (the "Gate is Green").
 
