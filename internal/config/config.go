@@ -2,9 +2,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"time"
 )
 
@@ -36,7 +36,7 @@ func Load() (Config, error) {
 	}
 
 	if c.DatabaseURL == "" {
-		return Config{}, fmt.Errorf("DATABASE_URL is required")
+		return Config{}, errors.New("DATABASE_URL is required")
 	}
 	return c, nil
 }
@@ -46,17 +46,4 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
-}
-
-// EnvInt reads an integer environment variable, returning fallback when unset.
-func EnvInt(key string, fallback int) (int, error) {
-	v := os.Getenv(key)
-	if v == "" {
-		return fallback, nil
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return 0, fmt.Errorf("%s: %w", key, err)
-	}
-	return n, nil
 }

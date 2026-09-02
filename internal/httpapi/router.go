@@ -16,6 +16,13 @@ import (
 	"github.com/EmersonAraki/go-ledger/internal/httpapi/problem"
 )
 
+// RequestTimeout bounds how long a single handler may run. It is exported
+// because http.Server's WriteTimeout must be strictly greater: if the two are
+// equal, the connection's write deadline expires at the same instant the
+// timeout response is written, and the client sees a dropped connection
+// instead of the error.
+const RequestTimeout = 30 * time.Second
+
 // Server wires dependencies into HTTP handlers.
 type Server struct {
 	pool *pgxpool.Pool
@@ -38,8 +45,9 @@ func (s *Server) Routes() http.Handler {
 	r.Use(requestLogger)
 	r.Use(middleware.Recoverer)
 	// A request that outlives this deadline is a bug; fail it rather than let
-	// it pin a database connection indefinitely.
-	r.Use(middleware.Timeout(30 * time.Second))
+	// it pin a database connection indefinitely. This deadline is also what
+	// bounds a pgxpool Acquire on the request path.
+	r.Use(middleware.Timeout(RequestTimeout))
 
 	// Unmatched routes must speak problem+json too, so clients only ever have
 	// one error shape to parse.

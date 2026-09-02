@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -29,12 +30,12 @@ func main() {
 func run() error {
 	args := os.Args[1:]
 	if len(args) == 0 {
-		return fmt.Errorf("usage: migrate (up|down [n]|version)")
+		return errors.New("usage: migrate (up|down [n]|version)")
 	}
 
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		return fmt.Errorf("DATABASE_URL is required")
+		return errors.New("DATABASE_URL is required")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)

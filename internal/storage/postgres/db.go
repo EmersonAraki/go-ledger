@@ -9,8 +9,13 @@ import (
 )
 
 // NewPool opens a connection pool and verifies it can reach the database.
-// Every acquire is bounded so a saturated pool surfaces as a timeout rather
-// than an unbounded wait.
+//
+// Note what is and is not bounded here. Establishing a new connection is capped
+// by ConnectTimeout, and idle or long-lived connections are recycled. Waiting
+// for a free connection from a saturated pool is NOT bounded by any pool
+// setting: pgxpool blocks in Acquire until the caller's context is done. Every
+// caller therefore needs a deadline on its context -- for HTTP requests that
+// comes from the timeout middleware; background workers must set their own.
 func NewPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
@@ -19,6 +24,7 @@ func NewPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	cfg.MaxConns = 10
 	cfg.MaxConnLifetime = time.Hour
 	cfg.MaxConnIdleTime = 5 * time.Minute
+	cfg.ConnConfig.ConnectTimeout = 5 * time.Second
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

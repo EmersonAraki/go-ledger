@@ -44,9 +44,13 @@ func run() error {
 		Addr:              cfg.HTTPAddr,
 		Handler:           httpapi.NewServer(pool).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		// Bounds reading the request body. This must grow before the
+		// reconciliation endpoint starts accepting large CSV uploads.
+		ReadTimeout: 15 * time.Second,
+		// Must exceed the handler timeout, so a timing-out handler still has an
+		// open connection to write its error response on.
+		WriteTimeout: httpapi.RequestTimeout + 5*time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
