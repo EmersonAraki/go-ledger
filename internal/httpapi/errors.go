@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/EmersonAraki/go-ledger/internal/httpapi/problem"
+	"github.com/EmersonAraki/go-ledger/internal/idempotency"
 	"github.com/EmersonAraki/go-ledger/internal/ledger"
 )
 
@@ -36,6 +37,12 @@ var domainErrors = []struct {
 	{ledger.ErrInvalidCurrency, errorMapping{http.StatusBadRequest, "invalid_currency", "Invalid Currency"}},
 	{ledger.ErrInvalidAccountKind, errorMapping{http.StatusBadRequest, "invalid_account_kind", "Invalid Account Kind"}},
 	{ledger.ErrEmptyName, errorMapping{http.StatusBadRequest, "invalid_name", "Invalid Name"}},
+
+	// Idempotency. A reused key is 422 rather than 400: the request is
+	// well-formed, but it conflicts with what that key already committed to.
+	{idempotency.ErrKeyRequired, errorMapping{http.StatusBadRequest, "idempotency_key_required", "Idempotency-Key Required"}},
+	{idempotency.ErrKeyInvalid, errorMapping{http.StatusBadRequest, "idempotency_key_invalid", "Invalid Idempotency-Key"}},
+	{ledger.ErrIdempotencyKeyReuse, errorMapping{http.StatusUnprocessableEntity, "idempotency_key_reuse", "Idempotency-Key Reuse"}},
 }
 
 // writeDomainError renders err as problem+json. Anything unrecognised is an

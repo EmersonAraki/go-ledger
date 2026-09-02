@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -58,7 +59,8 @@ func (s *Store) GetAccount(ctx context.Context, id uuid.UUID) (*ledger.Account, 
 	return &a, nil
 }
 
-// Transfer writes a two-leg transaction and both balance updates atomically.
+// Transfer claims the idempotency key and writes a two-leg transaction, both
+// balance updates and the rendered response -- all in one database transaction.
 //
 // Isolation: READ COMMITTED plus an explicit row lock on the two accounts,
 // taken in ascending id order. Ordering the lock acquisition is what makes
@@ -66,7 +68,16 @@ func (s *Store) GetAccount(ctx context.Context, id uuid.UUID) (*ledger.Account, 
 // REPEATABLE READ is deliberately not used here: in PostgreSQL that is snapshot
 // isolation, which does not prevent the write skew that lets two concurrent
 // withdrawals overdraw one account. See docs/IMPLEMENTATION_PLAN.md section 7.1.
-func (s *Store) Transfer(ctx context.Context, cmd ledger.TransferCommand) (*ledger.Transaction, error) {
+//
+// Idempotency: the claim row and the ledger writes commit together, so a
+// crashed or rejected request leaves no trace and its key stays usable. That is
+// why idempotency_keys has no "in flight" state and needs no janitor.
+func (s *Store) Transfer(
+	ctx context.Context,
+	cmd ledger.TransferCommand,
+	claim ledger.Claim,
+	render ledger.RenderFunc,
+) (*ledger.Result, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("begin transfer: %w", err)
@@ -74,6 +85,17 @@ func (s *Store) Transfer(ctx context.Context, cmd ledger.TransferCommand) (*ledg
 	// Rolled back unless the commit below succeeds. WithoutCancel so that a
 	// cancelled request still releases its locks promptly.
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	owned, err := claimKey(ctx, tx, claim)
+	if err != nil {
+		return nil, err
+	}
+	if !owned {
+		// Someone else owns this key. If they were still in flight, the INSERT
+		// above blocked on their uncommitted row until they committed or aborted,
+		// so by now the outcome is settled and readable.
+		return replayStoredResponse(ctx, tx, claim)
+	}
 
 	accounts, err := lockAccounts(ctx, tx, cmd.DebitAccountID, cmd.CreditAccountID)
 	if err != nil {
@@ -105,12 +127,99 @@ func (s *Store) Transfer(ctx context.Context, cmd ledger.TransferCommand) (*ledg
 		return nil, err
 	}
 
+	// Render inside the transaction: these bytes are what a later duplicate
+	// replays, so they must commit atomically with the work they describe.
+	status, body, err := render(result)
+	if err != nil {
+		return nil, fmt.Errorf("render response for storage: %w", err)
+	}
+
+	if err := storeResponse(ctx, tx, claim, status, body, result.ID); err != nil {
+		return nil, err
+	}
+
 	// The zero-sum trigger is DEFERRABLE INITIALLY DEFERRED, so an imbalance
 	// surfaces here, at COMMIT, rather than on the individual inserts.
 	if err := tx.Commit(ctx); err != nil {
 		return nil, translateWriteError(ctx, err)
 	}
-	return result, nil
+
+	return &ledger.Result{
+		Status:      status,
+		Body:        body,
+		Replayed:    false,
+		Transaction: result,
+	}, nil
+}
+
+// claimKey attempts to take ownership of the idempotency key, reporting whether
+// this transaction now owns it.
+//
+// The (key, endpoint) primary key is the entire concurrency control. When a
+// duplicate request races an in-flight one, ON CONFLICT DO NOTHING blocks on the
+// in-flight transaction's index tuple until it commits or aborts -- so the
+// duplicate never observes a half-finished state, and never has to poll.
+func claimKey(ctx context.Context, tx pgx.Tx, claim ledger.Claim) (bool, error) {
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO idempotency_keys (key, endpoint, request_hash)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (key, endpoint) DO NOTHING`,
+		claim.Key, claim.Endpoint, claim.Fingerprint)
+	if err != nil {
+		return false, fmt.Errorf("claim idempotency key: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// replayStoredResponse returns the response stored under an already-owned key.
+func replayStoredResponse(ctx context.Context, tx pgx.Tx, claim ledger.Claim) (*ledger.Result, error) {
+	var (
+		storedHash   []byte
+		storedStatus *int
+		storedBody   []byte
+	)
+	err := tx.QueryRow(ctx, `
+		SELECT request_hash, response_status, response_body
+		  FROM idempotency_keys
+		 WHERE key = $1 AND endpoint = $2`,
+		claim.Key, claim.Endpoint,
+	).Scan(&storedHash, &storedStatus, &storedBody)
+	if err != nil {
+		return nil, fmt.Errorf("read stored idempotent response: %w", err)
+	}
+
+	// Same key, different request: a client bug worth reporting loudly rather
+	// than silently returning someone else's response.
+	if !bytes.Equal(storedHash, claim.Fingerprint) {
+		return nil, fmt.Errorf("%w: key %q", ledger.ErrIdempotencyKeyReuse, claim.Key)
+	}
+
+	// Because the claim and the response commit together, a committed row always
+	// carries a response. A NULL here would mean that invariant broke.
+	if storedStatus == nil {
+		return nil, fmt.Errorf("internal: idempotency key %q committed without a response", claim.Key)
+	}
+
+	return &ledger.Result{
+		Status:   *storedStatus,
+		Body:     storedBody,
+		Replayed: true,
+	}, nil
+}
+
+// storeResponse records what the client is about to be told, so a duplicate
+// request can be answered identically without redoing the work.
+func storeResponse(ctx context.Context, tx pgx.Tx, claim ledger.Claim,
+	status int, body []byte, txID uuid.UUID) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE idempotency_keys
+		   SET response_status = $3, response_body = $4::json, transaction_id = $5
+		 WHERE key = $1 AND endpoint = $2`,
+		claim.Key, claim.Endpoint, status, string(body), txID)
+	if err != nil {
+		return fmt.Errorf("store idempotent response: %w", err)
+	}
+	return nil
 }
 
 // lockAccounts loads the given accounts FOR UPDATE, ordered by id so that

@@ -7,9 +7,11 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/EmersonAraki/go-ledger/internal/httpapi"
+	"github.com/EmersonAraki/go-ledger/internal/idempotency"
 	"github.com/EmersonAraki/go-ledger/internal/ledger"
 	"github.com/EmersonAraki/go-ledger/internal/platform/pgtest"
 	"github.com/EmersonAraki/go-ledger/internal/storage/postgres"
@@ -29,8 +31,15 @@ func newTestAPI(t *testing.T) *testAPI {
 	return &testAPI{t: t, handler: httpapi.NewServer(pool, svc).Routes(), pool: pool}
 }
 
-// do issues a request and returns the recorder. body may be nil.
+// do issues a request with a fresh idempotency key, so ordinary tests never
+// collide with one another.
 func (a *testAPI) do(method, path string, body any) *httptest.ResponseRecorder {
+	a.t.Helper()
+	return a.doWithKey(method, path, body, uuid.NewString())
+}
+
+// doWithKey issues a request under a caller-chosen idempotency key.
+func (a *testAPI) doWithKey(method, path string, body any, key string) *httptest.ResponseRecorder {
 	a.t.Helper()
 
 	var buf bytes.Buffer
@@ -41,6 +50,9 @@ func (a *testAPI) do(method, path string, body any) *httptest.ResponseRecorder {
 	}
 	req := httptest.NewRequest(method, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
+	if key != "" {
+		req.Header.Set(idempotency.HeaderKey, key)
+	}
 
 	rec := httptest.NewRecorder()
 	a.handler.ServeHTTP(rec, req)
