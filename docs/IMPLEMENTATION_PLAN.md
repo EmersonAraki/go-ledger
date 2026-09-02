@@ -35,11 +35,11 @@ The name is the invariant: every transaction's entries must sum to zero.
 | --- | --- | --- |
 | Router | `net/http` + `go-chi/chi/v5` | Stdlib-compatible handlers, middleware chain, URL params. No framework lock-in. |
 | Postgres driver | `jackc/pgx/v5` + `pgxpool` | Native protocol, explicit `pgx.Tx`, per-transaction `BeginTx` options for isolation levels, and typed error inspection (`*pgconn.PgError`) for constraint violations — which the idempotency path depends on. |
-| Migrations | `golang-migrate/migrate` with `embed.FS` | Versioned up/down SQL, embedded in the binary so `cmd/migrate` needs no files at runtime. |
+| Migrations | Small embedded migrator (`internal/storage/postgres/migrate.go`) | ~200 lines over `embed.FS`: advisory-locked, one transaction per migration, checksums applied migrations so an edited file is refused rather than silently divergent. `golang-migrate` was the original pick, but it drags in a driver tree for databases this project will never use, and a project whose whole point is explicit SQL should not hide its migration path behind a dependency. |
 | Money | `int64` minor units + ISO-4217 `currency` | Exact. No floats, no `decimal` dependency. `bigint` in Postgres. |
 | IDs | UUIDv7 (`google/uuid` v1.6+) | Time-ordered, so B-tree inserts stay local and `ORDER BY id` approximates chronological order. |
 | Logging | `log/slog` (stdlib) | Structured, no dependency. Request ID injected via context. |
-| Tests | `testcontainers-go` + real Postgres | The correctness claims here are *database* claims (unique constraints, deferred triggers, row locks). Mocking the DB would test nothing. |
+| Tests | Real Postgres via `TEST_DATABASE_URL` | The correctness claims here are *database* claims (unique constraints, deferred triggers, row locks); mocking the DB would test nothing. Each test gets its own schema, so tests run in parallel and cannot see each other's rows. `testcontainers-go` was the original pick, but pointing at a connection string needs no Docker socket, works in CI via a `services:` container, and keeps the dependency out of `go.mod`. With the variable unset, integration tests skip rather than fail, so `go test ./...` works with nothing running. |
 | Redis | Deferred to phase 8, cache-only | See §6.4 — Postgres is the sole source of truth for idempotency. |
 
 ---
@@ -557,8 +557,8 @@ Each phase ends on a green `make check` (lint + `go test -race ./...`) and its o
 
 | # | Phase | Deliverable | Done when |
 | --- | --- | --- | --- |
-| 0 | Scaffolding | Module, layout, `docker-compose.yml` (postgres, redis), `Makefile`, golangci-lint, GitHub Actions CI, `/healthz`, graceful shutdown | CI green on an empty test suite; `make up && make run` serves `/healthz` |
-| 1 | Schema | Migrations `0001`–`0005`, `cmd/migrate`, `pgtest` testcontainers helper | `migrate up` then `down` is clean; a test proves the deferred trigger rejects an unbalanced transaction |
+| 0 | Scaffolding | **Done.** Module, layout, `docker-compose.yml` (postgres, redis), `Makefile`, golangci-lint, GitHub Actions CI, `/healthz` + `/readyz`, graceful shutdown | `make check` green; server boots, serves both probes, and exits cleanly on SIGTERM |
+| 1 | Schema | **Done.** Migration `0001_init`, `cmd/migrate` (up/down/version), `pgtest` schema-per-test helper | `migrate up` is idempotent and `down`/`up` round-trips; 8 tests cover the deferred trigger, balance floor, and partial unique index |
 | 2 | Accounts + naive transactions | `POST/GET /accounts`, `POST /transactions` with no idempotency, problem+json errors | Integration tests for happy path, unknown account, currency mismatch, negative amount |
 | 3 | Idempotency | Middleware + `internal/idempotency`, fingerprinting, full response matrix (§6.3) | Every row of the §6.3 matrix has a test |
 | 4 | Double-entry hardening | `FOR UPDATE` ordered locking, balance floor, materialized balance, reversal endpoint | `SUM(signed_amount) = 0` holds after every test in the suite |

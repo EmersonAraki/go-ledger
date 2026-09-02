@@ -1,0 +1,36 @@
+# Local development services.
+#
+# Redis is defined here for phase 8 (idempotency response cache); nothing in the
+# service depends on it yet, and correctness never will -- Postgres is the sole
+# source of truth for idempotency ownership.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sumzero
+      POSTGRES_PASSWORD: sumzero
+      POSTGRES_DB: sumzero
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Create the test database alongside the dev one on first boot.
+      - ./scripts/init-test-db.sh:/docker-entrypoint-initdb.d/init-test-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sumzero -d sumzero"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  pgdata:

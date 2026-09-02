@@ -1,0 +1,12 @@
+DROP TABLE IF EXISTS reconciliation_discrepancies;
+DROP TABLE IF EXISTS reconciliation_runs;
+DROP TABLE IF EXISTS outbox_deliveries;
+DROP TABLE IF EXISTS outbox_events;
+DROP TABLE IF EXISTS idempotency_keys;
+DROP TABLE IF EXISTS ledger_entries;
+DROP FUNCTION IF EXISTS assert_transaction_balanced();
+DROP TABLE IF EXISTS transactions;
+DROP TABLE IF EXISTS accounts;
+DROP TYPE IF EXISTS outbox_status;
+DROP TYPE IF EXISTS entry_direction;
+DROP TYPE IF EXISTS account_kind;
