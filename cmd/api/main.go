@@ -13,6 +13,7 @@ import (
 
 	"github.com/EmersonAraki/go-ledger/internal/config"
 	"github.com/EmersonAraki/go-ledger/internal/httpapi"
+	"github.com/EmersonAraki/go-ledger/internal/ledger"
 	"github.com/EmersonAraki/go-ledger/internal/storage/postgres"
 )
 
@@ -42,7 +43,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewServer(pool).Routes(),
+		Handler:           httpapi.NewServer(pool, ledger.NewService(postgres.NewStore(pool))).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		// Bounds reading the request body. This must grow before the
 		// reconciliation endpoint starts accepting large CSV uploads.

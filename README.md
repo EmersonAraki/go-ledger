@@ -9,9 +9,24 @@ database enforces it.
 
 ## Status
 
-Phases 0 and 1 of [the implementation plan](docs/IMPLEMENTATION_PLAN.md) are
-complete: project scaffolding and the full schema with its invariants under test.
-Accounts and transaction endpoints (phase 2) are next.
+Phases 0-2 of [the implementation plan](docs/IMPLEMENTATION_PLAN.md) are
+complete: scaffolding, the schema with its invariants under test, and the
+accounts and transactions endpoints. Idempotency (phase 3) is next -- until then
+`POST /transactions` is not safe to retry, since a repeated request posts a
+second transfer.
+
+| Method | Path | |
+| --- | --- | --- |
+| `POST` | `/accounts` | Create an account (always starts at zero) |
+| `GET` | `/accounts/{id}` | Balance and details |
+| `POST` | `/transactions` | Transfer between two accounts |
+| `GET` | `/transactions/{id}` | Transaction with both legs |
+| `GET` | `/healthz`, `/readyz` | Liveness, readiness |
+
+Money crosses the wire as integer minor units plus a currency
+(`{"amount": 12345, "currency": "BRL"}` is R$123.45) -- never a float.
+In `POST /transactions` the money ends up in `debit_account_id`, funded by
+`credit_account_id`; the names follow accounting, not banking.
 
 ## Quick start
 
