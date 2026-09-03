@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/EmersonAraki/go-ledger/internal/httpapi/problem"
+	"github.com/EmersonAraki/go-ledger/internal/ledger"
 )
 
 // RequestTimeout bounds how long a single handler may run. It is exported
@@ -25,12 +26,14 @@ const RequestTimeout = 30 * time.Second
 
 // Server wires dependencies into HTTP handlers.
 type Server struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	ledger *ledger.Service
 }
 
-// NewServer builds the API handler set.
-func NewServer(pool *pgxpool.Pool) *Server {
-	return &Server{pool: pool}
+// NewServer builds the API handler set. The pool is used only for the readiness
+// probe; all ledger access goes through the service.
+func NewServer(pool *pgxpool.Pool, svc *ledger.Service) *Server {
+	return &Server{pool: pool, ledger: svc}
 }
 
 // Routes returns the fully-configured HTTP handler.
@@ -62,6 +65,16 @@ func (s *Server) Routes() http.Handler {
 
 	r.Get("/healthz", s.handleHealth)
 	r.Get("/readyz", s.handleReady)
+
+	r.Route("/accounts", func(r chi.Router) {
+		r.Post("/", s.handleCreateAccount)
+		r.Get("/{id}", s.handleGetAccount)
+	})
+
+	r.Route("/transactions", func(r chi.Router) {
+		r.Post("/", s.handleCreateTransaction)
+		r.Get("/{id}", s.handleGetTransaction)
+	})
 
 	return r
 }
