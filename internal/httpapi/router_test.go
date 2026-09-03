@@ -15,7 +15,7 @@ func TestHealthzIsAlwaysOK(t *testing.T) {
 
 	// Liveness must not depend on the database, so a nil pool is fine here:
 	// if this handler ever touches the pool, this test panics and says so.
-	srv := httpapi.NewServer(nil, nil, nil, nil)
+	srv := httpapi.NewServer(nil, nil, nil, nil, nil)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -37,7 +37,7 @@ func TestReadyzReportsReadyWhenDatabaseIsUp(t *testing.T) {
 	t.Parallel()
 
 	pool := pgtest.Pool(t)
-	srv := httpapi.NewServer(pool, nil, nil, nil)
+	srv := httpapi.NewServer(pool, nil, nil, nil, nil)
 
 	rec := httptest.NewRecorder()
 	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
@@ -53,7 +53,7 @@ func TestReadyzReportsUnavailableWhenDatabaseIsDown(t *testing.T) {
 	t.Parallel()
 
 	pool := pgtest.Pool(t)
-	srv := httpapi.NewServer(pool, nil, nil, nil)
+	srv := httpapi.NewServer(pool, nil, nil, nil, nil)
 
 	// Close the pool out from under the handler to simulate a database outage.
 	pool.Close()
@@ -69,7 +69,7 @@ func TestReadyzReportsUnavailableWhenDatabaseIsDown(t *testing.T) {
 func TestUnknownRouteReturnsProblemJSON(t *testing.T) {
 	t.Parallel()
 
-	srv := httpapi.NewServer(nil, nil, nil, nil)
+	srv := httpapi.NewServer(nil, nil, nil, nil, nil)
 
 	rec := httptest.NewRecorder()
 	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/does-not-exist", nil))
@@ -96,7 +96,7 @@ func TestUnknownRouteReturnsProblemJSON(t *testing.T) {
 func TestWrongMethodReturnsProblemJSON(t *testing.T) {
 	t.Parallel()
 
-	srv := httpapi.NewServer(nil, nil, nil, nil)
+	srv := httpapi.NewServer(nil, nil, nil, nil, nil)
 
 	rec := httptest.NewRecorder()
 	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/healthz", nil))

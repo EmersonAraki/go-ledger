@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -83,4 +84,13 @@ func parseUUIDField(w http.ResponseWriter, field, raw string) (uuid.UUID, bool) 
 		return uuid.Nil, false
 	}
 	return id, true
+}
+
+// formatTimePtr renders an optional timestamp in the shared format.
+func formatTimePtr(t *time.Time) *string {
+	if t == nil {
+		return nil
+	}
+	s := t.UTC().Format(timeFormat)
+	return &s
 }

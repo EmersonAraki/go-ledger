@@ -17,6 +17,7 @@ import (
 	"github.com/EmersonAraki/go-ledger/internal/httpapi/problem"
 	"github.com/EmersonAraki/go-ledger/internal/ledger"
 	"github.com/EmersonAraki/go-ledger/internal/outbox"
+	"github.com/EmersonAraki/go-ledger/internal/reconcile"
 )
 
 // RequestTimeout bounds how long a single handler may run. It is exported
@@ -35,12 +36,21 @@ type EventStore interface {
 	ReplayEvent(ctx context.Context, id uuid.UUID, p outbox.Publisher) (*outbox.Event, *outbox.Delivery, error)
 }
 
+// Reconciler is the reconciliation access the HTTP layer needs.
+type Reconciler interface {
+	Reconcile(ctx context.Context, sourceName string, rows []reconcile.StatementRow,
+		parseErrors []reconcile.Discrepancy, opts reconcile.Options) (*reconcile.Run, error)
+	GetRun(ctx context.Context, id uuid.UUID) (*reconcile.Run, error)
+	ListDiscrepancies(ctx context.Context, runID uuid.UUID, after int64, limit int) ([]reconcile.Discrepancy, int64, bool, error)
+}
+
 // Server wires dependencies into HTTP handlers.
 type Server struct {
-	pool      *pgxpool.Pool
-	ledger    *ledger.Service
-	events    EventStore
-	publisher outbox.Publisher
+	pool       *pgxpool.Pool
+	ledger     *ledger.Service
+	events     EventStore
+	publisher  outbox.Publisher
+	reconciler Reconciler
 }
 
 // NewServer builds the API handler set. The pool is used only for the readiness
@@ -49,8 +59,9 @@ type Server struct {
 // The publisher is the one a manual replay uses. It is the same publisher the
 // background relay drives, so a replayed event travels exactly the path an
 // automatic delivery would.
-func NewServer(pool *pgxpool.Pool, svc *ledger.Service, events EventStore, p outbox.Publisher) *Server {
-	return &Server{pool: pool, ledger: svc, events: events, publisher: p}
+func NewServer(pool *pgxpool.Pool, svc *ledger.Service, events EventStore,
+	p outbox.Publisher, rec Reconciler) *Server {
+	return &Server{pool: pool, ledger: svc, events: events, publisher: p, reconciler: rec}
 }
 
 // Routes returns the fully-configured HTTP handler.
@@ -96,6 +107,11 @@ func (s *Server) Routes() http.Handler {
 	r.Route("/events", func(r chi.Router) {
 		r.Get("/{id}", s.handleGetEvent)
 		r.Post("/{id}/replay", s.handleReplayEvent)
+	})
+
+	r.Route("/reconciliation", func(r chi.Router) {
+		r.Post("/", s.handleReconcile)
+		r.Get("/{id}", s.handleGetReconciliation)
 	})
 
 	return r
