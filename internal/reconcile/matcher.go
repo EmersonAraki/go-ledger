@@ -324,9 +324,11 @@ func DriftDiscrepancies(drifts []BalanceDrift) []Discrepancy {
 // missing from it. Rounding outward makes the window mean what the document
 // means.
 //
-// The result always sits inside the range the caller loads (which widens by at
-// least the date tolerance, a full day by default), so rounding cannot ask about
-// transactions that were never fetched.
+// Rounding can never ask about transactions that were not loaded, and the reason
+// is the call order rather than the sizes involved: the caller computes this
+// window FIRST and then widens it by the tolerance to build its query, so the
+// loaded range is [rounded start - tolerance, rounded end + tolerance] and this
+// window is a subset of it by construction, for any tolerance >= 0.
 func Window(rows []StatementRow) (start, end *time.Time) {
 	if len(rows) == 0 {
 		return nil, nil

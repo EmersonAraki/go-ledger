@@ -36,10 +36,21 @@ var ErrRunNotFound = errors.New("reconciliation run not found")
 func (s *Store) Reconcile(
 	ctx context.Context,
 	sourceName string,
-	rows []reconcile.StatementRow,
-	parseErrors []reconcile.Discrepancy,
+	stmt reconcile.Statement,
 	opts reconcile.Options,
 ) (*reconcile.Run, error) {
+	rows, parseErrors := stmt.Rows, stmt.Findings
+
+	// The window comes from the file's own dates, so it is attacker controlled.
+	// Reject an implausible span before opening a transaction: the query would
+	// otherwise load the entire ledger from a tiny upload.
+	if start, end := reconcile.Window(rows); start != nil && end != nil {
+		if span := end.Sub(*start); span > time.Duration(reconcile.MaxWindowDays)*24*time.Hour {
+			return nil, fmt.Errorf("%w: %.0f days, limit is %d",
+				reconcile.ErrWindowTooWide, span.Hours()/24, reconcile.MaxWindowDays)
+		}
+	}
+
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.RepeatableRead,
 		AccessMode: pgx.ReadOnly,
@@ -51,7 +62,7 @@ func (s *Store) Reconcile(
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
 	start, end := reconcile.Window(rows)
-	ledger, err := loadLedgerWindow(ctx, tx, start, end, opts.DateTolerance)
+	ledger, ledgerTruncated, err := loadLedgerWindow(ctx, tx, start, end, opts.DateTolerance)
 	if err != nil {
 		return nil, err
 	}
@@ -74,25 +85,42 @@ func (s *Store) Reconcile(
 		return nil, fmt.Errorf("release reconciliation snapshot: %w", err)
 	}
 
+	// Bound the statement comparison, which is the only part that scales with
+	// the upload. The integrity findings are deliberately exempt and appended
+	// after: drift is what keeps the materialized balance honest, and dropping
+	// it because a statement happened to be messy would silence the check
+	// precisely when the data is least trustworthy.
+	capped := discrepancies
+	var droppedFindings int
+	if len(capped) > reconcile.MaxFindings {
+		droppedFindings = len(capped) - reconcile.MaxFindings
+		capped = capped[:reconcile.MaxFindings]
+	}
+
 	all := make([]reconcile.Discrepancy, 0,
-		len(parseErrors)+len(discrepancies)+len(unreconcilable)+len(drifts))
+		len(parseErrors)+len(capped)+len(unreconcilable)+len(drifts)+2)
 	all = append(all, parseErrors...)
-	all = append(all, discrepancies...)
+	all = append(all, capped...)
 	all = append(all, unreconcilable...)
 	all = append(all, reconcile.DriftDiscrepancies(drifts)...)
 
-	// Bound what one run can store and return. Truncation is itself a finding,
-	// so a partial report can never be mistaken for a complete one.
-	if len(all) > reconcile.MaxFindings {
-		dropped := len(all) - reconcile.MaxFindings
-		all = all[:reconcile.MaxFindings]
+	if droppedFindings > 0 {
 		all = append(all, reconcile.Discrepancy{
 			Kind: reconcile.KindStatementTruncated,
 			Details: map[string]any{
 				"reason":       "too many findings to report individually",
 				"reported":     reconcile.MaxFindings,
-				"unreported":   dropped,
+				"unreported":   droppedFindings,
 				"max_findings": reconcile.MaxFindings,
+			},
+		})
+	}
+	if ledgerTruncated {
+		all = append(all, reconcile.Discrepancy{
+			Kind: reconcile.KindLedgerTruncated,
+			Details: map[string]any{
+				"reason":     "the statement window holds more transactions than one comparison loads",
+				"max_loaded": reconcile.MaxLedgerWindowRows,
 			},
 		})
 	}
@@ -100,7 +128,7 @@ func (s *Store) Reconcile(
 	run := &reconcile.Run{
 		ID:               uuid.New(),
 		SourceName:       sourceName,
-		StatementRows:    len(rows) + len(parseErrors),
+		StatementRows:    stmt.RowsRead,
 		MatchedCount:     matched,
 		DiscrepancyCount: len(all),
 		WindowStart:      start,
@@ -119,9 +147,9 @@ func (s *Store) Reconcile(
 // posted just outside the statement's range can still be matched to a row
 // inside it, rather than being reported missing on both sides.
 func loadLedgerWindow(ctx context.Context, tx pgx.Tx, start, end *time.Time,
-	tolerance time.Duration) ([]reconcile.LedgerTransaction, error) {
+	tolerance time.Duration) ([]reconcile.LedgerTransaction, bool, error) {
 	if start == nil || end == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	if tolerance <= 0 {
 		tolerance = reconcile.DefaultDateTolerance
@@ -145,10 +173,11 @@ func loadLedgerWindow(ctx context.Context, tx pgx.Tx, start, end *time.Time,
 		 WHERE t.created_at BETWEEN $1::timestamptz - $3::interval
 		                        AND $2::timestamptz + $3::interval
 		   AND (SELECT COUNT(*) FROM ledger_entries e WHERE e.transaction_id = t.id) = 2
-		 ORDER BY t.created_at, t.id`,
-		start.UTC(), end.UTC(), intervalOf(tolerance))
+		 ORDER BY t.created_at, t.id
+		 LIMIT $4`,
+		start.UTC(), end.UTC(), intervalOf(tolerance), reconcile.MaxLedgerWindowRows+1)
 	if err != nil {
-		return nil, fmt.Errorf("load ledger window: %w", err)
+		return nil, false, fmt.Errorf("load ledger window: %w", err)
 	}
 	defer rows.Close()
 
@@ -157,14 +186,19 @@ func loadLedgerWindow(ctx context.Context, tx pgx.Tx, start, end *time.Time,
 		var t reconcile.LedgerTransaction
 		if err := rows.Scan(&t.ID, &t.ExternalRef, &t.PostedAt,
 			&t.DebitAccountID, &t.CreditAccountID, &t.Amount, &t.Currency); err != nil {
-			return nil, fmt.Errorf("scan ledger transaction: %w", err)
+			return nil, false, fmt.Errorf("scan ledger transaction: %w", err)
 		}
 		out = append(out, t)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read ledger window: %w", err)
+		return nil, false, fmt.Errorf("read ledger window: %w", err)
 	}
-	return out, nil
+
+	// One row beyond the limit was requested purely to detect the limit biting.
+	if len(out) > reconcile.MaxLedgerWindowRows {
+		return out[:reconcile.MaxLedgerWindowRows], true, nil
+	}
+	return out, false, nil
 }
 
 // loadUnreconcilable finds transactions in the window that the statement format
@@ -178,7 +212,10 @@ func loadUnreconcilable(ctx context.Context, tx pgx.Tx, start, end *time.Time) (
 	rows, err := tx.Query(ctx, `
 		SELECT t.id, t.currency, t.created_at, COUNT(e.id) AS legs
 		  FROM transactions t
-		  JOIN ledger_entries e ON e.transaction_id = t.id
+		  -- LEFT JOIN: the zero-sum trigger permits a transaction with no legs
+		  -- at all, and an inner join would make those invisible to the very
+		  -- check that exists so nothing is silently excluded.
+		  LEFT JOIN ledger_entries e ON e.transaction_id = t.id
 		 WHERE t.created_at BETWEEN $1 AND $2
 		 GROUP BY t.id, t.currency, t.created_at
 		HAVING COUNT(e.id) <> 2

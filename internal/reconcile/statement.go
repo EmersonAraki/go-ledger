@@ -15,6 +15,18 @@ import (
 // ErrMissingHeader means the CSV had no usable header row.
 var ErrMissingHeader = errors.New("statement is empty or has no header row")
 
+// Statement is the result of parsing an uploaded file.
+type Statement struct {
+	// Rows are the rows that parsed.
+	Rows []StatementRow
+	// Findings are per-row parse failures and any truncation notice.
+	Findings []Discrepancy
+	// RowsRead is how many data rows were actually read, which is the honest
+	// denominator for a run summary -- len(Rows)+len(Findings) is not, because
+	// findings are capped and include synthetic entries.
+	RowsRead int
+}
+
 // StatementRow is one line of an external statement.
 type StatementRow struct {
 	// Line is the 1-based line number in the source file, so an operator can
@@ -40,7 +52,7 @@ var requiredColumns = []string{
 // full [][]string never exist at once. A malformed row becomes an
 // unparseable_row discrepancy instead of aborting the run: one bad line must not
 // hide every other finding in the file.
-func ParseStatement(r io.Reader) ([]StatementRow, []Discrepancy, error) {
+func ParseStatement(r io.Reader) (Statement, error) {
 	reader := csv.NewReader(r)
 	reader.FieldsPerRecord = -1 // validated per row, with a useful message
 	reader.TrimLeadingSpace = true
@@ -48,15 +60,15 @@ func ParseStatement(r io.Reader) ([]StatementRow, []Discrepancy, error) {
 
 	header, err := reader.Read()
 	if errors.Is(err, io.EOF) {
-		return nil, nil, ErrMissingHeader
+		return Statement{}, ErrMissingHeader
 	}
 	if err != nil {
-		return nil, nil, fmt.Errorf("read header: %w", err)
+		return Statement{}, fmt.Errorf("read header: %w", err)
 	}
 
 	index, err := indexHeader(header)
 	if err != nil {
-		return nil, nil, err
+		return Statement{}, err
 	}
 
 	var (
@@ -68,17 +80,22 @@ func ParseStatement(r io.Reader) ([]StatementRow, []Discrepancy, error) {
 		truncated     bool
 	)
 	for {
-		if dataRows >= MaxStatementRows {
-			truncated = true
-			break
-		}
-
 		record, err := reader.Read()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		lineNum++
 		dataRows++
+
+		// Check AFTER reading, not before. Checking first means a file of
+		// exactly MaxStatementRows rows is stamped truncated without ever
+		// discovering EOF -- a complete comparison reported as incomplete, which
+		// in an audit artifact is the wrong direction to be wrong in.
+		if dataRows > MaxStatementRows {
+			truncated = true
+			dataRows--
+			break
+		}
 
 		if err != nil {
 			// A parse error here is structural (bad quoting, stray delimiter).
@@ -93,7 +110,7 @@ func ParseStatement(r io.Reader) ([]StatementRow, []Discrepancy, error) {
 				continue
 			}
 			// Anything else is an I/O failure; the file cannot be trusted.
-			return nil, nil, fmt.Errorf("read statement: %w", err)
+			return Statement{}, fmt.Errorf("read statement: %w", err)
 		}
 
 		row, err := parseRow(lineNum, record, index)
@@ -111,7 +128,7 @@ func ParseStatement(r io.Reader) ([]StatementRow, []Discrepancy, error) {
 	if truncated || suppressedBad > 0 {
 		bad = append(bad, truncationFinding(dataRows, suppressedBad, truncated))
 	}
-	return rows, bad, nil
+	return Statement{Rows: rows, Findings: bad, RowsRead: dataRows}, nil
 }
 
 // truncationFinding records that limits were hit, so a partial comparison can

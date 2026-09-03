@@ -430,13 +430,19 @@ func TestReconcileDoesNotReportActivityOutsideTheStatementWindow(t *testing.T) {
 	older := api.postTransferWithRef(bob, alice, 100, "TRX-OLD")
 	recent := api.postTransferWithRef(bob, alice, 200, "TRX-NEW")
 
-	// Backdate the funding transfer and the older transfer out of the statement's
-	// day. Three days keeps the test independent of the wall-clock time it runs
-	// at, which a sub-day offset would not be.
+	// Backdate by exactly one day. This value is load-bearing in two directions
+	// and neither is obvious:
+	//   - A full 24h always lands on the previous UTC day whatever hour the test
+	//     runs at, so the assertion is not time-of-day dependent. A sub-day
+	//     offset would be.
+	//   - It stays INSIDE the +/-24h that loadLedgerWindow widens by, so the
+	//     unfixed matcher loads these transactions and misreports them. Backdate
+	//     further and they are never loaded at all, the old code has nothing to
+	//     over-report, and this test silently asserts nothing.
 	fundingID := api.transactionIDForAmount(10_000)
 	for _, id := range []string{older, fundingID} {
 		if _, err := api.pool.Exec(context.Background(),
-			`UPDATE transactions SET created_at = created_at - interval '3 days' WHERE id = $1`,
+			`UPDATE transactions SET created_at = created_at - interval '1 day' WHERE id = $1`,
 			id); err != nil {
 			t.Fatalf("backdate %s: %v", id, err)
 		}
@@ -669,5 +675,71 @@ func TestPostCursorIsUsableAgainstGet(t *testing.T) {
 	if len(seen) != run.DiscrepancyCount {
 		t.Errorf("client saw %d distinct findings, run reports %d",
 			len(seen), run.DiscrepancyCount)
+	}
+}
+
+// The comparison window comes from the file's own dates, so it is client
+// controlled. A tiny upload claiming to span centuries would otherwise make the
+// ledger query load every transaction that has ever existed.
+func TestReconcileRejectsAnImplausibleWindow(t *testing.T) {
+	t.Parallel()
+	api := newTestAPI(t)
+
+	alice := api.createAccount("alice", "BRL", false)
+	bob := api.createAccount("bob", "BRL", false)
+	api.fund(alice, "BRL", 1000)
+
+	csv := csvHeader +
+		fmt.Sprintf("TRX-ANCIENT,1970-01-01,%s,%s,1,BRL\n", bob, alice) +
+		fmt.Sprintf("TRX-FUTURE,2100-01-01,%s,%s,1,BRL\n", bob, alice)
+
+	api.assertProblem(api.uploadStatement("centuries.csv", csv),
+		http.StatusBadRequest, "statement_window_too_wide")
+
+	// A plausible span is still accepted.
+	ok := csvHeader +
+		fmt.Sprintf("TRX-A,2026-09-01,%s,%s,1,BRL\n", bob, alice) +
+		fmt.Sprintf("TRX-B,2026-09-30,%s,%s,1,BRL\n", bob, alice)
+	if rec := api.uploadStatement("month.csv", ok); rec.Code != http.StatusCreated {
+		t.Errorf("a one-month statement was rejected: status %d, body %s", rec.Code, rec.Body)
+	}
+}
+
+// ADR 0003 forbids floats for money. The stored details travel through JSON, and
+// decoding into map[string]any turns numbers into float64 unless asked not to --
+// so the same finding could report different amounts from the two endpoints.
+func TestReconciliationAmountsSurviveBothEndpointsExactly(t *testing.T) {
+	t.Parallel()
+	api := newTestAPI(t)
+
+	alice := api.createAccount("alice", "BRL", false)
+	bob := api.createAccount("bob", "BRL", false)
+	api.fund(alice, "BRL", 1000)
+
+	// Beyond 2^53, where float64 stops being able to represent consecutive
+	// integers. 9007199254740993 rounds to ...992 if it passes through a float.
+	const huge = "9007199254740993"
+
+	csv := csvHeader +
+		fmt.Sprintf("TRX-HUGE,2026-09-01T10:00:00Z,%s,%s,%s,BRL\n", bob, alice, huge)
+
+	rec := api.uploadStatement("huge.csv", csv)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("upload: status %d, body %s", rec.Code, rec.Body)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(huge)) {
+		t.Fatalf("POST did not return the exact amount %s: %s", huge, rec.Body)
+	}
+
+	var run runBody
+	api.decode(rec, &run)
+
+	got := api.do(http.MethodGet, "/reconciliation/"+run.ID, nil)
+	if got.Code != http.StatusOK {
+		t.Fatalf("get: status %d, body %s", got.Code, got.Body)
+	}
+	if !bytes.Contains(got.Body.Bytes(), []byte(huge)) {
+		t.Errorf("GET lost precision on a monetary amount: expected %s in\n%s",
+			huge, got.Body)
 	}
 }

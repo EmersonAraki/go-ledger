@@ -1,6 +1,7 @@
 package reconcile_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -21,7 +22,8 @@ func TestParseStatementReadsRows(t *testing.T) {
 		"TRX-1,2026-09-01T10:00:00Z," + accA + "," + accB + ",12345,BRL\n" +
 		"TRX-2,2026-09-02," + accB + "," + accA + ",500,BRL\n"
 
-	rows, bad, err := reconcile.ParseStatement(strings.NewReader(in))
+	stmt, err := reconcile.ParseStatement(strings.NewReader(in))
+	rows, bad := stmt.Rows, stmt.Findings
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -51,7 +53,8 @@ func TestParseStatementAcceptsAnyColumnOrder(t *testing.T) {
 	in := "amount,currency,external_ref,credit_account_id,debit_account_id,posted_at\n" +
 		"999,BRL,TRX-9," + accB + "," + accA + ",2026-09-01\n"
 
-	rows, _, err := reconcile.ParseStatement(strings.NewReader(in))
+	stmt, err := reconcile.ParseStatement(strings.NewReader(in))
+	rows := stmt.Rows
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -74,7 +77,8 @@ func TestParseStatementReportsBadRowsAndKeepsGoing(t *testing.T) {
 		"TRX-4,2026-09-01," + accA + "," + accB + ",abc,BRL\n" +
 		"TRX-5,2026-09-01," + accA + "," + accB + ",100,BRL\n"
 
-	rows, bad, err := reconcile.ParseStatement(strings.NewReader(in))
+	stmt, err := reconcile.ParseStatement(strings.NewReader(in))
+	rows, bad := stmt.Rows, stmt.Findings
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -101,7 +105,8 @@ func TestParseStatementRejectsDecimalAmounts(t *testing.T) {
 
 	in := header + "TRX-1,2026-09-01," + accA + "," + accB + ",123.45,BRL\n"
 
-	rows, bad, err := reconcile.ParseStatement(strings.NewReader(in))
+	stmt, err := reconcile.ParseStatement(strings.NewReader(in))
+	rows, bad := stmt.Rows, stmt.Findings
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -119,14 +124,14 @@ func TestParseStatementRejectsDecimalAmounts(t *testing.T) {
 func TestParseStatementRejectsUnusableFiles(t *testing.T) {
 	t.Parallel()
 
-	if _, _, err := reconcile.ParseStatement(strings.NewReader("")); err == nil {
+	if _, err := reconcile.ParseStatement(strings.NewReader("")); err == nil {
 		t.Error("expected an empty file to be rejected")
 	}
 
 	// Missing a required column: every row would be meaningless, so this is a
 	// file-level failure rather than a per-row finding.
 	in := "external_ref,posted_at,amount\nTRX-1,2026-09-01,100\n"
-	_, _, err := reconcile.ParseStatement(strings.NewReader(in))
+	_, err := reconcile.ParseStatement(strings.NewReader(in))
 	if err == nil {
 		t.Fatal("expected a missing-column file to be rejected")
 	}
@@ -154,7 +159,8 @@ func TestParseStatementRejectsInvalidFieldValues(t *testing.T) {
 
 	for name, line := range cases {
 		t.Run(name, func(t *testing.T) {
-			rows, bad, err := reconcile.ParseStatement(strings.NewReader(header + line + "\n"))
+			stmt, err := reconcile.ParseStatement(strings.NewReader(header + line + "\n"))
+			rows, bad := stmt.Rows, stmt.Findings
 			if err != nil {
 				t.Fatalf("parse: %v", err)
 			}
@@ -177,7 +183,8 @@ func TestParseStatementSurvivesStructuralDamage(t *testing.T) {
 		"\"unterminated,2026-09-01," + accA + "," + accB + ",100,BRL\n" +
 		"TRX-3,2026-09-01," + accA + "," + accB + ",300,BRL\n"
 
-	rows, bad, err := reconcile.ParseStatement(strings.NewReader(in))
+	stmt, err := reconcile.ParseStatement(strings.NewReader(in))
+	rows, bad := stmt.Rows, stmt.Findings
 	if err != nil {
 		t.Fatalf("a structurally broken line must not fail the whole file: %v", err)
 	}
@@ -195,7 +202,8 @@ func TestParseStatementStripsByteOrderMark(t *testing.T) {
 
 	in := "\ufeff" + header + "TRX-1,2026-09-01," + accA + "," + accB + ",100,BRL\n"
 
-	rows, _, err := reconcile.ParseStatement(strings.NewReader(in))
+	stmt, err := reconcile.ParseStatement(strings.NewReader(in))
+	rows := stmt.Rows
 	if err != nil {
 		t.Fatalf("a BOM-prefixed statement was rejected: %v", err)
 	}
@@ -215,7 +223,8 @@ func TestParseStatementCapsRunawayInput(t *testing.T) {
 		b.WriteString(",,,,,\n")
 	}
 
-	rows, bad, err := reconcile.ParseStatement(strings.NewReader(b.String()))
+	stmt, err := reconcile.ParseStatement(strings.NewReader(b.String()))
+	rows, bad := stmt.Rows, stmt.Findings
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -240,5 +249,54 @@ func TestParseStatementCapsRunawayInput(t *testing.T) {
 	}
 	if truncation.Details["unreported_parse_errors"] == nil {
 		t.Errorf("truncation finding does not say how much was suppressed: %+v", truncation.Details)
+	}
+}
+
+// A file of exactly the row limit is complete, not truncated. Stamping a
+// complete comparison as partial is the wrong direction to be wrong in for an
+// artifact whose value is "did this compare everything".
+func TestParseStatementDoesNotFlagAnExactlyFullFile(t *testing.T) {
+	t.Parallel()
+
+	var b strings.Builder
+	b.WriteString(header)
+	for i := range reconcile.MaxStatementRows {
+		fmt.Fprintf(&b, "TRX-%d,2026-09-01,%s,%s,%d,BRL\n", i, accA, accB, 100+i)
+	}
+
+	stmt, err := reconcile.ParseStatement(strings.NewReader(b.String()))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(stmt.Rows) != reconcile.MaxStatementRows {
+		t.Errorf("parsed %d rows, want %d", len(stmt.Rows), reconcile.MaxStatementRows)
+	}
+	if stmt.RowsRead != reconcile.MaxStatementRows {
+		t.Errorf("RowsRead = %d, want %d", stmt.RowsRead, reconcile.MaxStatementRows)
+	}
+	for _, f := range stmt.Findings {
+		if f.Kind == reconcile.KindStatementTruncated {
+			t.Errorf("a complete file was reported truncated: %+v", f.Details)
+		}
+	}
+
+	// One row more and it genuinely is truncated.
+	b.WriteString(fmt.Sprintf("TRX-EXTRA,2026-09-01,%s,%s,1,BRL\n", accA, accB))
+	stmt, err = reconcile.ParseStatement(strings.NewReader(b.String()))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var truncated bool
+	for _, f := range stmt.Findings {
+		if f.Kind == reconcile.KindStatementTruncated {
+			truncated = true
+		}
+	}
+	if !truncated {
+		t.Error("a file one row over the limit was not reported truncated")
+	}
+	if stmt.RowsRead != reconcile.MaxStatementRows {
+		t.Errorf("RowsRead = %d, want %d (the extra row is not counted as read)",
+			stmt.RowsRead, reconcile.MaxStatementRows)
 	}
 }

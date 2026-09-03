@@ -38,8 +38,8 @@ type EventStore interface {
 
 // Reconciler is the reconciliation access the HTTP layer needs.
 type Reconciler interface {
-	Reconcile(ctx context.Context, sourceName string, rows []reconcile.StatementRow,
-		parseErrors []reconcile.Discrepancy, opts reconcile.Options) (*reconcile.Run, error)
+	Reconcile(ctx context.Context, sourceName string, stmt reconcile.Statement,
+		opts reconcile.Options) (*reconcile.Run, error)
 	GetRun(ctx context.Context, id uuid.UUID) (*reconcile.Run, error)
 	ListDiscrepancies(ctx context.Context, runID uuid.UUID, after int64, limit int) ([]reconcile.Discrepancy, int64, bool, error)
 }

@@ -9,6 +9,7 @@
 package reconcile
 
 import (
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -52,6 +53,10 @@ const (
 	// movements that merely look alike are the same one.
 	KindProbableMatch = "probable_match"
 
+	// KindLedgerTruncated means the ledger window held more transactions than one
+	// comparison will load, so the comparison is partial.
+	KindLedgerTruncated = "ledger_truncated"
+
 	// KindStatementTruncated means the statement exceeded a processing limit and
 	// was only partly read. Reported as a finding rather than an error so the
 	// partial result is still usable, and so the report can never silently claim
@@ -90,12 +95,29 @@ const (
 	// nobody while making the response and the insert unbounded.
 	MaxFindings = 10_000
 
+	// MaxWindowDays bounds the period a statement may claim to cover.
+	//
+	// The window is derived from the file's own dates, so it is attacker
+	// controlled: two rows dated 1970 and 2100 make the ledger query load every
+	// transaction that has ever existed, from an 80-byte upload. Capping the
+	// rows and the findings does not help, because the cost there scales with
+	// the DATABASE, not the upload. A statement spanning more than a year is not
+	// a statement.
+	MaxWindowDays = 366
+
+	// MaxLedgerWindowRows bounds how much ledger is pulled into memory for one
+	// comparison, whatever the window turns out to contain.
+	MaxLedgerWindowRows = 200_000
+
 	// MaxReportedParseErrors is the most individual unparseable-row findings
 	// collected. Beyond it the remainder are counted, not listed: a file that is
 	// wrong on every line needs one clear answer, not a hundred thousand copies
 	// of it.
 	MaxReportedParseErrors = 1_000
 )
+
+// ErrWindowTooWide means the statement claims to span an implausible period.
+var ErrWindowTooWide = errors.New("statement window is too wide")
 
 // Discrepancy is one disagreement worth an operator's attention.
 type Discrepancy struct {

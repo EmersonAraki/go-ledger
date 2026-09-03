@@ -19,9 +19,13 @@ import (
 // upload can exhaust the process.
 const maxStatementSize = 32 << 20 // 32 MiB
 
-// statementReadTimeout is how long the upload alone may take to arrive. Sized so
-// the size cap above is actually reachable over a slow connection.
-const statementReadTimeout = 2 * time.Minute
+// statementReadTimeout is how long the upload alone may take to arrive.
+//
+// It lifts the body read from the server's ReadTimeout, which is sized for small
+// JSON bodies, up to the request ceiling -- and no further: middleware.Timeout
+// cancels the handler at RequestTimeout regardless, so a larger value here would
+// be a comment describing something that cannot happen.
+const statementReadTimeout = RequestTimeout
 
 // statementField is the multipart form field carrying the CSV.
 const statementField = "file"
@@ -85,10 +89,10 @@ func newRunResponse(run *reconcile.Run, discrepancies []reconcile.Discrepancy, n
 // posted through the normal API. This endpoint only reports.
 func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	// The server's ReadTimeout is sized for small JSON bodies. A statement is
-	// orders of magnitude larger, and at the default a slow upload would be cut
-	// off mid-body -- the client seeing a dropped connection rather than a
-	// problem+json. Extend the deadline for this handler alone rather than
-	// raising it for every endpoint.
+	// orders of magnitude larger, and at the default a slow upload is cut off
+	// mid-body -- the client seeing a dropped connection rather than a
+	// problem+json. Lift it for this handler alone rather than raising it for
+	// every endpoint.
 	if err := http.NewResponseController(w).SetReadDeadline(
 		time.Now().Add(statementReadTimeout)); err != nil {
 		slog.WarnContext(r.Context(), "could not extend read deadline for statement upload",
@@ -111,7 +115,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = file.Close() }()
 
-	rows, parseErrors, err := reconcile.ParseStatement(file)
+	stmt, err := reconcile.ParseStatement(file)
 	if err != nil {
 		// The file itself is unusable -- no header, or missing columns. That is a
 		// bad request, distinct from individual rows failing to parse, which are
@@ -121,8 +125,14 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	run, err := s.reconciler.Reconcile(r.Context(), header.Filename, rows, parseErrors, reconcile.Options{})
+	run, err := s.reconciler.Reconcile(r.Context(), header.Filename, stmt, reconcile.Options{})
 	if err != nil {
+		// An implausible window is the client's doing, not a server fault.
+		if errors.Is(err, reconcile.ErrWindowTooWide) {
+			problem.Write(w, http.StatusBadRequest, "statement_window_too_wide",
+				"Statement Window Too Wide", err.Error())
+			return
+		}
 		problem.Internal(w, err)
 		return
 	}
