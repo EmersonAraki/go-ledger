@@ -35,11 +35,12 @@ const DefaultDateTolerance = 24 * time.Hour
 
 // Options tunes matching.
 type Options struct {
-	// DateTolerance overrides DefaultDateTolerance when non-zero.
+	// DateTolerance overrides DefaultDateTolerance when non-zero. It governs
+	// both how far a referenced pair's dates may differ and how far apart a
+	// heuristic pairing may be -- deliberately one knob, because the caller
+	// loads the ledger window using this same value, and a separate heuristic
+	// window could search a range that was never loaded.
 	DateTolerance time.Duration
-	// HeuristicWindow is how far apart a probable match may be. Defaults to
-	// DateTolerance when zero.
-	HeuristicWindow time.Duration
 }
 
 func (o Options) dateTolerance() time.Duration {
@@ -49,11 +50,16 @@ func (o Options) dateTolerance() time.Duration {
 	return DefaultDateTolerance
 }
 
-func (o Options) heuristicWindow() time.Duration {
-	if o.HeuristicWindow > 0 {
-		return o.HeuristicWindow
-	}
-	return o.dateTolerance()
+// shapeKey identifies a transfer by everything except its reference and time.
+type shapeKey struct {
+	debit    uuid.UUID
+	credit   uuid.UUID
+	amount   int64
+	currency string
+}
+
+func shapeOf(debit, credit uuid.UUID, amount int64, currency string) shapeKey {
+	return shapeKey{debit: debit, credit: credit, amount: amount, currency: currency}
 }
 
 // Match compares a statement against the ledger.
@@ -120,9 +126,10 @@ func Match(rows []StatementRow, ledger []LedgerTransaction, opts Options) (match
 	}
 
 	// Pass 2: heuristic pairing on shape.
+	byShape := shapeIndex(ledger)
 	var stillUnpaired []StatementRow
 	for _, row := range unpairedRows {
-		candidate := findByShape(row, ledger, pairedLedger, opts.heuristicWindow())
+		candidate := findByShape(row, byShape, pairedLedger, opts.dateTolerance())
 		if candidate == nil {
 			stillUnpaired = append(stillUnpaired, row)
 			continue
@@ -159,12 +166,23 @@ func Match(rows []StatementRow, ledger []LedgerTransaction, opts Options) (match
 		})
 	}
 
-	// Ledger transactions the statement does not mention. The caller has already
-	// restricted `ledger` to the statement's window, so everything left here is
-	// genuinely unaccounted for rather than merely out of period.
+	// Ledger transactions the statement does not mention.
+	//
+	// The caller loads a WIDER range than the statement covers, by the date
+	// tolerance, so that a transfer posted just outside can still be paired with
+	// a row inside. That widening is for pairing only. Reporting on it would turn
+	// every neighbouring day of ordinary activity into "unaccounted for", which
+	// is how a reconciliation report becomes something operators learn to ignore.
+	// So the sweep is clamped to the statement's own window, derived here from
+	// the same rows the pairing used -- the caller cannot pass a window that
+	// disagrees with the data.
+	windowStart, windowEnd := Window(rows)
 	for i := range ledger {
 		tx := ledger[i]
 		if pairedLedger[tx.ID] {
+			continue
+		}
+		if !within(tx.PostedAt, windowStart, windowEnd) {
 			continue
 		}
 		discrepancies = append(discrepancies, Discrepancy{
@@ -235,19 +253,28 @@ func compare(row StatementRow, tx LedgerTransaction, tolerance time.Duration) []
 	return out
 }
 
-// findByShape looks for an unpaired ledger transaction that moves the same
-// money between the same accounts at about the same time.
-func findByShape(row StatementRow, ledger []LedgerTransaction,
-	paired map[uuid.UUID]bool, window time.Duration) *LedgerTransaction {
+// shapeIndex groups ledger transactions by shape so the heuristic pass is linear
+// rather than a full scan per unpaired row. A statement and a ledger window can
+// both run to tens of thousands of entries; scanning one for each row of the
+// other is quadratic and, with no cancellation inside the loop, keeps a core
+// busy long after the request deadline has passed.
+func shapeIndex(ledger []LedgerTransaction) map[shapeKey][]*LedgerTransaction {
+	index := make(map[shapeKey][]*LedgerTransaction, len(ledger))
 	for i := range ledger {
 		tx := &ledger[i]
+		key := shapeOf(tx.DebitAccountID, tx.CreditAccountID, tx.Amount, tx.Currency)
+		index[key] = append(index[key], tx)
+	}
+	return index
+}
+
+// findByShape returns an unpaired ledger transaction that moves the same money
+// between the same accounts at about the same time.
+func findByShape(row StatementRow, index map[shapeKey][]*LedgerTransaction,
+	paired map[uuid.UUID]bool, window time.Duration) *LedgerTransaction {
+	key := shapeOf(row.DebitAccountID, row.CreditAccountID, row.Amount, row.Currency)
+	for _, tx := range index[key] {
 		if paired[tx.ID] {
-			continue
-		}
-		if tx.Amount != row.Amount || tx.Currency != row.Currency {
-			continue
-		}
-		if tx.DebitAccountID != row.DebitAccountID || tx.CreditAccountID != row.CreditAccountID {
 			continue
 		}
 		if d := row.PostedAt.Sub(tx.PostedAt); d > window || d < -window {
@@ -256,6 +283,15 @@ func findByShape(row StatementRow, ledger []LedgerTransaction,
 		return tx
 	}
 	return nil
+}
+
+// within reports whether t falls inside an inclusive window. A nil bound means
+// there is no window at all, which happens only for an empty statement.
+func within(t time.Time, start, end *time.Time) bool {
+	if start == nil || end == nil {
+		return false
+	}
+	return !t.Before(*start) && !t.After(*end)
 }
 
 // DriftDiscrepancies turns balance drift findings into discrepancies.
@@ -277,6 +313,20 @@ func DriftDiscrepancies(drifts []BalanceDrift) []Discrepancy {
 }
 
 // Window returns the period a statement covers, or nils when it has no rows.
+//
+// The bounds are rounded outward to whole UTC days, which is not cosmetic. A
+// statement is a periodic document and its timestamps are frequently coarse --
+// `posted_at` is often a bare date, and even a full timestamp is usually the
+// settlement second rather than the moment of posting. Taking the raw
+// [min, max] would make the window narrower than the period the statement
+// actually describes: for a daily statement whose rows all read 2026-09-01 it
+// would be zero-width, and nothing in the ledger would ever be reported
+// missing from it. Rounding outward makes the window mean what the document
+// means.
+//
+// The result always sits inside the range the caller loads (which widens by at
+// least the date tolerance, a full day by default), so rounding cannot ask about
+// transactions that were never fetched.
 func Window(rows []StatementRow) (start, end *time.Time) {
 	if len(rows) == 0 {
 		return nil, nil
@@ -290,7 +340,9 @@ func Window(rows []StatementRow) (start, end *time.Time) {
 			hi = r.PostedAt
 		}
 	}
-	lo, hi = lo.UTC(), hi.UTC()
+
+	lo = lo.UTC().Truncate(24 * time.Hour)
+	hi = hi.UTC().Truncate(24 * time.Hour).Add(24*time.Hour - time.Nanosecond)
 	return &lo, &hi
 }
 

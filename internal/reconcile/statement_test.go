@@ -136,3 +136,109 @@ func TestParseStatementRejectsUnusableFiles(t *testing.T) {
 		}
 	}
 }
+
+// Rejection branches that had no coverage. The negative-amount case matters
+// most: a refund line is a plausible real statement row, and bucketing it as
+// unparseable rather than reconciling it is a decision worth pinning down.
+func TestParseStatementRejectsInvalidFieldValues(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]string{
+		"negative amount":     "TRX-1,2026-09-01," + accA + "," + accB + ",-500,BRL",
+		"zero amount":         "TRX-1,2026-09-01," + accA + "," + accB + ",0,BRL",
+		"same account":        "TRX-1,2026-09-01," + accA + "," + accA + ",100,BRL",
+		"two-letter currency": "TRX-1,2026-09-01," + accA + "," + accB + ",100,BR",
+		"empty currency":      "TRX-1,2026-09-01," + accA + "," + accB + ",100,",
+		"empty date":          "TRX-1,," + accA + "," + accB + ",100,BRL",
+	}
+
+	for name, line := range cases {
+		t.Run(name, func(t *testing.T) {
+			rows, bad, err := reconcile.ParseStatement(strings.NewReader(header + line + "\n"))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if len(rows) != 0 {
+				t.Errorf("row was accepted: %+v", rows)
+			}
+			if len(bad) != 1 || bad[0].Kind != reconcile.KindUnparseableRow {
+				t.Errorf("findings = %+v, want one unparseable_row", bad)
+			}
+		})
+	}
+}
+
+// A structurally broken line (bad quoting) must be reported, not abort the file.
+func TestParseStatementSurvivesStructuralDamage(t *testing.T) {
+	t.Parallel()
+
+	in := header +
+		"TRX-1,2026-09-01," + accA + "," + accB + ",100,BRL\n" +
+		"\"unterminated,2026-09-01," + accA + "," + accB + ",100,BRL\n" +
+		"TRX-3,2026-09-01," + accA + "," + accB + ",300,BRL\n"
+
+	rows, bad, err := reconcile.ParseStatement(strings.NewReader(in))
+	if err != nil {
+		t.Fatalf("a structurally broken line must not fail the whole file: %v", err)
+	}
+	if len(bad) == 0 {
+		t.Error("the broken line was not reported")
+	}
+	if len(rows) == 0 {
+		t.Error("no good rows survived a single broken line")
+	}
+}
+
+// Excel writes a UTF-8 BOM. Without stripping it the first column looks absent.
+func TestParseStatementStripsByteOrderMark(t *testing.T) {
+	t.Parallel()
+
+	in := "\ufeff" + header + "TRX-1,2026-09-01," + accA + "," + accB + ",100,BRL\n"
+
+	rows, _, err := reconcile.ParseStatement(strings.NewReader(in))
+	if err != nil {
+		t.Fatalf("a BOM-prefixed statement was rejected: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ExternalRef != "TRX-1" {
+		t.Errorf("rows = %+v", rows)
+	}
+}
+
+// An unbounded statement must not produce unbounded work. Without a cap, a body
+// of comma-only lines expands into hundreds of megabytes of findings.
+func TestParseStatementCapsRunawayInput(t *testing.T) {
+	t.Parallel()
+
+	var b strings.Builder
+	b.WriteString(header)
+	for range reconcile.MaxStatementRows + 5_000 {
+		b.WriteString(",,,,,\n")
+	}
+
+	rows, bad, err := reconcile.ParseStatement(strings.NewReader(b.String()))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("got %d rows from garbage input, want 0", len(rows))
+	}
+
+	// Individual findings are capped, plus one truncation finding.
+	if len(bad) > reconcile.MaxReportedParseErrors+1 {
+		t.Errorf("collected %d findings, want at most %d",
+			len(bad), reconcile.MaxReportedParseErrors+1)
+	}
+
+	var truncation *reconcile.Discrepancy
+	for i := range bad {
+		if bad[i].Kind == reconcile.KindStatementTruncated {
+			truncation = &bad[i]
+		}
+	}
+	if truncation == nil {
+		t.Fatal("truncation was not reported; a partial read must never look complete")
+	}
+	if truncation.Details["unreported_parse_errors"] == nil {
+		t.Errorf("truncation finding does not say how much was suppressed: %+v", truncation.Details)
+	}
+}

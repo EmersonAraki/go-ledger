@@ -41,11 +41,7 @@ type eventResponse struct {
 }
 
 func newEventResponse(e *outbox.Event, deliveries []outbox.Delivery) eventResponse {
-	var publishedAt *string
-	if e.PublishedAt != nil {
-		s := e.PublishedAt.UTC().Format(timeFormat)
-		publishedAt = &s
-	}
+	publishedAt := formatTimePtr(e.PublishedAt)
 
 	out := make([]deliveryResponse, 0, len(deliveries))
 	for _, d := range deliveries {

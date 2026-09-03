@@ -2,8 +2,10 @@ package httpapi
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -16,6 +18,10 @@ import (
 // row at a time, but the request body still has to be bounded or a single
 // upload can exhaust the process.
 const maxStatementSize = 32 << 20 // 32 MiB
+
+// statementReadTimeout is how long the upload alone may take to arrive. Sized so
+// the size cap above is actually reachable over a slow connection.
+const statementReadTimeout = 2 * time.Minute
 
 // statementField is the multipart form field carrying the CSV.
 const statementField = "file"
@@ -78,6 +84,17 @@ func newRunResponse(run *reconcile.Run, discrepancies []reconcile.Discrepancy, n
 // The ledger is never modified: a real correction is a reversing transaction
 // posted through the normal API. This endpoint only reports.
 func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
+	// The server's ReadTimeout is sized for small JSON bodies. A statement is
+	// orders of magnitude larger, and at the default a slow upload would be cut
+	// off mid-body -- the client seeing a dropped connection rather than a
+	// problem+json. Extend the deadline for this handler alone rather than
+	// raising it for every endpoint.
+	if err := http.NewResponseController(w).SetReadDeadline(
+		time.Now().Add(statementReadTimeout)); err != nil {
+		slog.WarnContext(r.Context(), "could not extend read deadline for statement upload",
+			"error", err)
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, maxStatementSize)
 
 	file, header, err := r.FormFile(statementField)
@@ -110,7 +127,18 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, newRunResponse(run, run.Discrepancies, nil))
+	// Return at most a page of findings, matching what GET would serve, so a run
+	// with thousands of them does not produce one enormous response. The full set
+	// is stored and paginated through GET /reconciliation/{id}.
+	shown := run.Discrepancies
+	var next *int64
+	if len(shown) > defaultDiscrepancyPage {
+		shown = shown[:defaultDiscrepancyPage]
+		// Findings are stored in order, so the first page ends at the Nth row.
+		cursor := int64(defaultDiscrepancyPage)
+		next = &cursor
+	}
+	writeJSON(w, http.StatusCreated, newRunResponse(run, shown, next))
 }
 
 // handleGetReconciliation returns a stored run and a page of its findings.

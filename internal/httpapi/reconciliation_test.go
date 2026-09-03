@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/EmersonAraki/go-ledger/internal/reconcile"
 )
 
@@ -134,6 +136,10 @@ func TestReconcileReportsEveryDiscrepancyKind(t *testing.T) {
 	wrongAmount := api.postTransferWithRef(bob, alice, 300, "TRX-AMOUNT")
 	// In the ledger and on the statement, but between different accounts.
 	wrongAccounts := api.postTransferWithRef(bob, alice, 400, "TRX-ACCOUNT")
+	// In the ledger and on the statement, but in a different currency.
+	wrongCurrency := api.postTransferWithRef(bob, alice, 500, "TRX-CURRENCY")
+	// In the ledger and on the statement, but dated far outside the tolerance.
+	wrongDate := api.postTransferWithRef(bob, alice, 600, "TRX-DATE")
 	// In the ledger only.
 	api.postTransferWithRef(carol, alice, 700, "TRX-LEDGER-ONLY")
 	// In the ledger with no reference; the statement row has none either.
@@ -146,6 +152,12 @@ func TestReconcileReportsEveryDiscrepancyKind(t *testing.T) {
 		fmt.Sprintf("TRX-AMOUNT,%s,%s,%s,999,BRL\n", at(wrongAmount), bob, alice) +
 		// account_mismatch
 		fmt.Sprintf("TRX-ACCOUNT,%s,%s,%s,400,BRL\n", at(wrongAccounts), carol, alice) +
+		// currency_mismatch
+		fmt.Sprintf("TRX-CURRENCY,%s,%s,%s,500,USD\n", at(wrongCurrency), bob, alice) +
+		// date_mismatch -- beyond the 24h tolerance, so the referenced pair still
+		// matches but the dates are reported as disagreeing.
+		fmt.Sprintf("TRX-DATE,%s,%s,%s,600,BRL\n",
+			api.postedAt(wrongDate).Add(-40*time.Hour).Format(time.RFC3339), bob, alice) +
 		// missing_in_ledger
 		fmt.Sprintf("TRX-GHOST,%s,%s,%s,555,BRL\n", at(wrongAmount), bob, alice) +
 		// duplicate_in_statement
@@ -172,6 +184,8 @@ func TestReconcileReportsEveryDiscrepancyKind(t *testing.T) {
 		reconcile.KindDuplicateInStatement,
 		reconcile.KindProbableMatch,
 		reconcile.KindUnparseableRow,
+		reconcile.KindCurrencyMismatch,
+		reconcile.KindDateMismatch,
 	} {
 		if got[want] == 0 {
 			t.Errorf("expected at least one %s, got: %v", want, got)
@@ -395,5 +409,167 @@ func TestReconciliationPaginationReportsTheEndExactly(t *testing.T) {
 	// limit=1 over N findings must take exactly N pages, not N+1.
 	if pages != total {
 		t.Errorf("took %d pages for %d findings at limit=1, want %d", pages, total, total)
+	}
+}
+
+// A statement covering one period must not report activity from a neighbouring
+// period as missing. The ledger query deliberately widens its range by the date
+// tolerance so a near-miss can still be paired -- but that widening is for
+// pairing only. Reporting on it turns every adjacent day of normal activity into
+// noise, which is how a reconciliation report becomes something operators learn
+// to ignore.
+func TestReconcileDoesNotReportActivityOutsideTheStatementWindow(t *testing.T) {
+	t.Parallel()
+	api := newTestAPI(t)
+
+	alice := api.createAccount("alice", "BRL", false)
+	bob := api.createAccount("bob", "BRL", false)
+	api.fund(alice, "BRL", 10_000)
+
+	// Two transfers. The statement will name only the second.
+	older := api.postTransferWithRef(bob, alice, 100, "TRX-OLD")
+	recent := api.postTransferWithRef(bob, alice, 200, "TRX-NEW")
+
+	// Backdate the funding transfer and the older transfer out of the statement's
+	// day. Three days keeps the test independent of the wall-clock time it runs
+	// at, which a sub-day offset would not be.
+	fundingID := api.transactionIDForAmount(10_000)
+	for _, id := range []string{older, fundingID} {
+		if _, err := api.pool.Exec(context.Background(),
+			`UPDATE transactions SET created_at = created_at - interval '3 days' WHERE id = $1`,
+			id); err != nil {
+			t.Fatalf("backdate %s: %v", id, err)
+		}
+	}
+
+	csv := csvHeader + fmt.Sprintf("TRX-NEW,%s,%s,%s,200,BRL\n",
+		api.postedAt(recent).Format(time.RFC3339), bob, alice)
+
+	rec := api.uploadStatement("one-day.csv", csv)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("upload: status %d, body %s", rec.Code, rec.Body)
+	}
+
+	var run runBody
+	api.decode(rec, &run)
+
+	if run.MatchedCount != 1 {
+		t.Errorf("matched_count = %d, want 1", run.MatchedCount)
+	}
+	if got := run.kinds()[reconcile.KindMissingInStatement]; got != 0 {
+		t.Errorf("missing_in_statement = %d, want 0 -- transactions outside the "+
+			"statement's window were reported as unaccounted for (all kinds: %v)",
+			got, run.kinds())
+	}
+	if !run.Clean {
+		t.Errorf("expected a clean run, got %d findings: %v", run.DiscrepancyCount, run.kinds())
+	}
+}
+
+// The pagination query parameters are new validation surface with four 400
+// branches and no coverage.
+func TestReconciliationRejectsBadPaginationParameters(t *testing.T) {
+	t.Parallel()
+	api := newTestAPI(t)
+
+	alice := api.createAccount("alice", "BRL", false)
+	bob := api.createAccount("bob", "BRL", false)
+	api.fund(alice, "BRL", 1000)
+
+	rec := api.uploadStatement("s.csv", csvHeader+
+		fmt.Sprintf("TRX-GHOST,2026-09-01T10:00:00Z,%s,%s,100,BRL\n", bob, alice))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("upload: status %d, body %s", rec.Code, rec.Body)
+	}
+	var run runBody
+	api.decode(rec, &run)
+
+	for name, tc := range map[string]struct{ query, typ string }{
+		"non-numeric cursor": {"?after=abc", "invalid_cursor"},
+		"negative cursor":    {"?after=-1", "invalid_cursor"},
+		"zero limit":         {"?limit=0", "invalid_limit"},
+		"oversized limit":    {"?limit=501", "invalid_limit"},
+		"non-numeric limit":  {"?limit=many", "invalid_limit"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api.assertProblem(
+				api.do(http.MethodGet, "/reconciliation/"+run.ID+tc.query, nil),
+				http.StatusBadRequest, tc.typ)
+		})
+	}
+
+	// The boundaries themselves must be accepted.
+	for _, ok := range []string{"?limit=1", "?limit=500", "?after=0"} {
+		if rec := api.do(http.MethodGet, "/reconciliation/"+run.ID+ok, nil); rec.Code != http.StatusOK {
+			t.Errorf("%s was rejected: status %d, body %s", ok, rec.Code, rec.Body)
+		}
+	}
+}
+
+// A multi-leg transaction cannot be expressed on a two-column statement. It must
+// still be reported: silently excluding it would let the job announce a clean
+// period while money it never examined had moved.
+func TestReconcileReportsTransactionsItCannotExpress(t *testing.T) {
+	t.Parallel()
+	api := newTestAPI(t)
+
+	alice := api.createAccount("alice", "BRL", false)
+	bob := api.createAccount("bob", "BRL", false)
+	carol := api.createAccount("carol", "BRL", false)
+	api.fund(alice, "BRL", 10_000)
+
+	// Write a balanced three-leg transaction directly: the API only exposes the
+	// two-leg case, but the schema has supported N legs since migration 0001.
+	ctx := context.Background()
+	txID := uuid.NewString()
+
+	dbTx, err := api.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = dbTx.Rollback(context.Background()) }()
+
+	if _, err := dbTx.Exec(ctx,
+		`INSERT INTO transactions (id, currency, external_ref) VALUES ($1,'BRL','TRX-SPLIT')`,
+		txID); err != nil {
+		t.Fatalf("insert transaction: %v", err)
+	}
+	for _, e := range [][]any{
+		{uuid.NewString(), txID, bob, "debit", int64(300)},
+		{uuid.NewString(), txID, carol, "debit", int64(200)},
+		{uuid.NewString(), txID, alice, "credit", int64(500)},
+	} {
+		if _, err := dbTx.Exec(ctx, `
+			INSERT INTO ledger_entries (id, transaction_id, account_id, direction, amount, currency)
+			VALUES ($1,$2,$3,$4,$5,'BRL')`, e...); err != nil {
+			t.Fatalf("insert entry: %v", err)
+		}
+	}
+	// The zero-sum trigger is DEFERRABLE INITIALLY DEFERRED, so the three legs
+	// are only checked here, together: 300 + 200 - 500 = 0.
+	if err := dbTx.Commit(ctx); err != nil {
+		t.Fatalf("commit three-leg transaction: %v", err)
+	}
+
+	rec := api.uploadStatement("split.csv", csvHeader+
+		fmt.Sprintf("FUND-%s,%s,%s,%s,10000,BRL\n", alice[:8],
+			api.postedAt(api.transactionIDForAmount(10_000)).Format(time.RFC3339),
+			alice, api.fundingSource))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("upload: status %d, body %s", rec.Code, rec.Body)
+	}
+
+	var run runBody
+	api.decode(rec, &run)
+	if got := run.kinds()[reconcile.KindUnreconcilableTransaction]; got != 1 {
+		t.Errorf("unreconcilable_transaction = %d, want 1 -- a three-leg transaction "+
+			"was silently excluded (all kinds: %v)", got, run.kinds())
+	}
+	for _, d := range run.Discrepancies {
+		if d.Kind == reconcile.KindUnreconcilableTransaction {
+			if legs, _ := d.Details["legs"].(float64); legs != 3 {
+				t.Errorf("legs = %v, want 3", d.Details["legs"])
+			}
+		}
 	}
 }

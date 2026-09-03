@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,9 @@ import (
 
 	"github.com/EmersonAraki/go-ledger/internal/reconcile"
 )
+
+// maxDiscrepancyPage bounds one page of findings.
+const maxDiscrepancyPage = 500
 
 // ErrRunNotFound means no reconciliation run has the given id.
 var ErrRunNotFound = errors.New("reconciliation run not found")
@@ -54,6 +58,11 @@ func (s *Store) Reconcile(
 
 	matched, discrepancies := reconcile.Match(rows, ledger, opts)
 
+	unreconcilable, err := loadUnreconcilable(ctx, tx, start, end)
+	if err != nil {
+		return nil, err
+	}
+
 	drifts, err := loadBalanceDrift(ctx, tx)
 	if err != nil {
 		return nil, err
@@ -65,10 +74,28 @@ func (s *Store) Reconcile(
 		return nil, fmt.Errorf("release reconciliation snapshot: %w", err)
 	}
 
-	all := make([]reconcile.Discrepancy, 0, len(parseErrors)+len(discrepancies)+len(drifts))
+	all := make([]reconcile.Discrepancy, 0,
+		len(parseErrors)+len(discrepancies)+len(unreconcilable)+len(drifts))
 	all = append(all, parseErrors...)
 	all = append(all, discrepancies...)
+	all = append(all, unreconcilable...)
 	all = append(all, reconcile.DriftDiscrepancies(drifts)...)
+
+	// Bound what one run can store and return. Truncation is itself a finding,
+	// so a partial report can never be mistaken for a complete one.
+	if len(all) > reconcile.MaxFindings {
+		dropped := len(all) - reconcile.MaxFindings
+		all = all[:reconcile.MaxFindings]
+		all = append(all, reconcile.Discrepancy{
+			Kind: reconcile.KindStatementTruncated,
+			Details: map[string]any{
+				"reason":       "too many findings to report individually",
+				"reported":     reconcile.MaxFindings,
+				"unreported":   dropped,
+				"max_findings": reconcile.MaxFindings,
+			},
+		})
+	}
 
 	run := &reconcile.Run{
 		ID:               uuid.New(),
@@ -118,7 +145,7 @@ func loadLedgerWindow(ctx context.Context, tx pgx.Tx, start, end *time.Time,
 		 WHERE t.created_at BETWEEN $1::timestamptz - $3::interval
 		                        AND $2::timestamptz + $3::interval
 		   AND (SELECT COUNT(*) FROM ledger_entries e WHERE e.transaction_id = t.id) = 2
-		 ORDER BY t.created_at`,
+		 ORDER BY t.created_at, t.id`,
 		start.UTC(), end.UTC(), intervalOf(tolerance))
 	if err != nil {
 		return nil, fmt.Errorf("load ledger window: %w", err)
@@ -134,7 +161,60 @@ func loadLedgerWindow(ctx context.Context, tx pgx.Tx, start, end *time.Time,
 		}
 		out = append(out, t)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read ledger window: %w", err)
+	}
+	return out, nil
+}
+
+// loadUnreconcilable finds transactions in the window that the statement format
+// cannot describe, so they can be reported instead of silently skipped by the
+// two-leg restriction in loadLedgerWindow.
+func loadUnreconcilable(ctx context.Context, tx pgx.Tx, start, end *time.Time) ([]reconcile.Discrepancy, error) {
+	if start == nil || end == nil {
+		return nil, nil
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT t.id, t.currency, t.created_at, COUNT(e.id) AS legs
+		  FROM transactions t
+		  JOIN ledger_entries e ON e.transaction_id = t.id
+		 WHERE t.created_at BETWEEN $1 AND $2
+		 GROUP BY t.id, t.currency, t.created_at
+		HAVING COUNT(e.id) <> 2
+		 ORDER BY t.created_at, t.id`, start.UTC(), end.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("load unreconcilable transactions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []reconcile.Discrepancy
+	for rows.Next() {
+		var (
+			id       uuid.UUID
+			currency string
+			postedAt time.Time
+			legs     int
+		)
+		if err := rows.Scan(&id, &currency, &postedAt, &legs); err != nil {
+			return nil, fmt.Errorf("scan unreconcilable transaction: %w", err)
+		}
+		txID := id
+		out = append(out, reconcile.Discrepancy{
+			Kind:          reconcile.KindUnreconcilableTransaction,
+			TransactionID: &txID,
+			Details: map[string]any{
+				"reason":    "transaction has a shape a two-column statement cannot express",
+				"legs":      legs,
+				"currency":  currency,
+				"posted_at": postedAt.UTC(),
+			},
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read unreconcilable transactions: %w", err)
+	}
+	return out, nil
 }
 
 // loadBalanceDrift finds accounts whose cached balance disagrees with the sum of
@@ -235,8 +315,10 @@ func (s *Store) GetRun(ctx context.Context, id uuid.UUID) (*reconcile.Run, error
 // hands the client a cursor that leads to an empty page.
 func (s *Store) ListDiscrepancies(ctx context.Context, runID uuid.UUID,
 	after int64, limit int) ([]reconcile.Discrepancy, int64, bool, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 100
+	// The handler rejects an out-of-range limit before reaching here; this is the
+	// backstop for any other caller.
+	if limit <= 0 || limit > maxDiscrepancyPage {
+		limit = maxDiscrepancyPage
 	}
 
 	rows, err := s.pool.Query(ctx, `
@@ -263,7 +345,14 @@ func (s *Store) ListDiscrepancies(ctx context.Context, runID uuid.UUID,
 		if err := rows.Scan(&id, &d.Kind, &d.StatementRef, &d.TransactionID, &details); err != nil {
 			return nil, 0, false, fmt.Errorf("scan discrepancy: %w", err)
 		}
-		if err := json.Unmarshal(details, &d.Details); err != nil {
+		// UseNumber, not a plain Unmarshal: decoding into map[string]any turns
+		// every JSON number into a float64, which silently rounds the int64
+		// amounts these details carry. The POST response marshals straight from
+		// int64, so without this the same stored finding reports different
+		// amounts depending on which endpoint you ask.
+		dec := json.NewDecoder(bytes.NewReader(details))
+		dec.UseNumber()
+		if err := dec.Decode(&d.Details); err != nil {
 			return nil, 0, false, fmt.Errorf("decode discrepancy details: %w", err)
 		}
 		out = append(out, d)

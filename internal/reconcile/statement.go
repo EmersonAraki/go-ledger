@@ -60,21 +60,34 @@ func ParseStatement(r io.Reader) ([]StatementRow, []Discrepancy, error) {
 	}
 
 	var (
-		rows    []StatementRow
-		bad     []Discrepancy
-		lineNum = 1 // the header
+		rows          []StatementRow
+		bad           []Discrepancy
+		lineNum       = 1 // the header
+		dataRows      int
+		suppressedBad int
+		truncated     bool
 	)
 	for {
+		if dataRows >= MaxStatementRows {
+			truncated = true
+			break
+		}
+
 		record, err := reader.Read()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		lineNum++
+		dataRows++
 
 		if err != nil {
 			// A parse error here is structural (bad quoting, stray delimiter).
 			// Record it and keep going.
-			bad = append(bad, unparseable(lineNum, err.Error()))
+			if len(bad) < MaxReportedParseErrors {
+				bad = append(bad, unparseable(lineNum, err.Error()))
+			} else {
+				suppressedBad++
+			}
 			var parseErr *csv.ParseError
 			if errors.As(err, &parseErr) {
 				continue
@@ -85,19 +98,49 @@ func ParseStatement(r io.Reader) ([]StatementRow, []Discrepancy, error) {
 
 		row, err := parseRow(lineNum, record, index)
 		if err != nil {
-			bad = append(bad, unparseable(lineNum, err.Error()))
+			if len(bad) < MaxReportedParseErrors {
+				bad = append(bad, unparseable(lineNum, err.Error()))
+			} else {
+				suppressedBad++
+			}
 			continue
 		}
 		rows = append(rows, row)
 	}
 
+	if truncated || suppressedBad > 0 {
+		bad = append(bad, truncationFinding(dataRows, suppressedBad, truncated))
+	}
 	return rows, bad, nil
+}
+
+// truncationFinding records that limits were hit, so a partial comparison can
+// never be mistaken for a complete one.
+func truncationFinding(dataRows, suppressed int, rowLimitHit bool) Discrepancy {
+	details := map[string]any{
+		"rows_read": dataRows,
+	}
+	if rowLimitHit {
+		details["reason"] = "statement exceeded the row limit and was read only in part"
+		details["max_rows"] = MaxStatementRows
+	} else {
+		details["reason"] = "too many unparseable rows to list individually"
+	}
+	if suppressed > 0 {
+		details["unreported_parse_errors"] = suppressed
+		details["max_reported_parse_errors"] = MaxReportedParseErrors
+	}
+	return Discrepancy{Kind: KindStatementTruncated, Details: details}
 }
 
 // indexHeader maps required column names to their position.
 func indexHeader(header []string) (map[string]int, error) {
 	index := make(map[string]int, len(header))
 	for i, name := range header {
+		// A UTF-8 BOM is not whitespace, so TrimSpace leaves it attached to the
+		// first column name. Spreadsheets export it routinely, and without this
+		// the file is rejected for "missing" a column that is plainly present.
+		name = strings.TrimPrefix(name, "\ufeff")
 		index[strings.ToLower(strings.TrimSpace(name))] = i
 	}
 

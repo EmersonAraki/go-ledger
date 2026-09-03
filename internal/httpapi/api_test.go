@@ -103,13 +103,13 @@ func (a *testAPI) fund(accountID, currency string, amount int64) {
 
 	source := a.createAccount("external-"+accountID[:8], currency, true)
 	a.fundingSource = source
-	rec := a.doWithKey(http.MethodPost, "/transactions", map[string]any{
+	rec := a.do(http.MethodPost, "/transactions", map[string]any{
 		"debit_account_id":  accountID,
 		"credit_account_id": source,
 		"amount":            amount,
 		"currency":          currency,
 		"external_ref":      "FUND-" + accountID[:8],
-	}, uuid.NewString())
+	})
 	if rec.Code != http.StatusCreated {
 		a.t.Fatalf("fund account: status %d, body %s", rec.Code, rec.Body)
 	}

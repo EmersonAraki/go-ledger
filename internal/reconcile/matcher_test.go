@@ -233,10 +233,23 @@ func TestWindowSpansTheStatement(t *testing.T) {
 	if start == nil || end == nil {
 		t.Fatal("expected a window")
 	}
-	if !start.Equal(base) {
-		t.Errorf("start = %v, want %v", start, base)
+
+	// Rounded outward to whole days: statement timestamps are coarse, and a
+	// window narrower than the period the document describes would under-report.
+	wantStart := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	wantEnd := time.Date(2026, 9, 3, 23, 59, 59, int(time.Second-time.Nanosecond), time.UTC)
+	if !start.Equal(wantStart) {
+		t.Errorf("start = %v, want %v (start of the first day)", start, wantStart)
 	}
-	if !end.Equal(base.Add(48 * time.Hour)) {
-		t.Errorf("end = %v, want %v", end, base.Add(48*time.Hour))
+	if !end.Equal(wantEnd) {
+		t.Errorf("end = %v, want %v (end of the last day)", end, wantEnd)
+	}
+
+	// Every row must fall inside the window it produced.
+	for _, r := range rows {
+		if r.PostedAt.Before(*start) || r.PostedAt.After(*end) {
+			t.Errorf("row at %v falls outside its own statement window [%v, %v]",
+				r.PostedAt, start, end)
+		}
 	}
 }

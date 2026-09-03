@@ -49,14 +49,52 @@ const (
 
 	// KindProbableMatch is a heuristic pairing made without a shared reference.
 	// Reported rather than silently reconciled: a human decides whether two
-	// движения that merely look alike are the same one.
+	// movements that merely look alike are the same one.
 	KindProbableMatch = "probable_match"
+
+	// KindStatementTruncated means the statement exceeded a processing limit and
+	// was only partly read. Reported as a finding rather than an error so the
+	// partial result is still usable, and so the report can never silently claim
+	// to have compared more than it did.
+	KindStatementTruncated = "statement_truncated"
+
+	// KindUnreconcilableTransaction is a ledger transaction inside the statement's
+	// window with a shape the statement format cannot express -- more than two
+	// legs. It is reported rather than skipped: silently excluding it would let
+	// the job announce a clean period while money it never examined had moved,
+	// which is precisely the failure this job exists to catch.
+	KindUnreconcilableTransaction = "unreconcilable_transaction"
 
 	// KindBalanceDrift means an account's cached balance disagrees with the sum
 	// of its entries. Not a statement finding at all -- an internal integrity
 	// check that rides along, because this job already holds a consistent
 	// snapshot of the whole ledger.
 	KindBalanceDrift = "balance_drift"
+)
+
+// Processing limits.
+//
+// The parser reads rows one at a time, but its OUTPUT is proportional to the
+// input: an unbounded file yields unbounded slices of rows and findings, each
+// far larger than the bytes that produced it. A 32 MiB body of empty comma-only
+// lines expands into hundreds of megabytes of retained heap, and there is no
+// per-client limit on this endpoint. These caps bound the work a single upload
+// can cause.
+const (
+	// MaxStatementRows is the most data rows read from one statement.
+	MaxStatementRows = 100_000
+
+	// MaxFindings is the most discrepancies stored and returned for one run.
+	// Beyond it the report is truncated: a run with more findings than this is
+	// telling the operator something systemic, and listing every instance helps
+	// nobody while making the response and the insert unbounded.
+	MaxFindings = 10_000
+
+	// MaxReportedParseErrors is the most individual unparseable-row findings
+	// collected. Beyond it the remainder are counted, not listed: a file that is
+	// wrong on every line needs one clear answer, not a hundred thousand copies
+	// of it.
+	MaxReportedParseErrors = 1_000
 )
 
 // Discrepancy is one disagreement worth an operator's attention.
