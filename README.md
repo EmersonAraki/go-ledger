@@ -10,9 +10,9 @@ database enforces it.
 ## Status
 
 Phases 0-2 of [the implementation plan](docs/IMPLEMENTATION_PLAN.md) are
-complete: scaffolding, the schema with its invariants under test, the accounts
-and transactions endpoints, and idempotent transfers. The outbox and event
-replay (phase 6) are next.
+complete, plus phase 6: scaffolding, the schema with its invariants under test,
+the accounts and transactions endpoints, idempotent transfers, and the
+transactional outbox with event replay. Reconciliation (phase 7) is next.
 
 | Method | Path | |
 | --- | --- | --- |
@@ -20,6 +20,8 @@ replay (phase 6) are next.
 | `GET` | `/accounts/{id}` | Balance and details |
 | `POST` | `/transactions` | Transfer between two accounts (requires `Idempotency-Key`) |
 | `GET` | `/transactions/{id}` | Transaction with both legs |
+| `GET` | `/events/{id}` | Outbox event, its envelope and delivery history |
+| `POST` | `/events/{id}/replay` | Re-publish an event |
 | `GET` | `/healthz`, `/readyz` | Liveness, readiness |
 
 Money crosses the wire as integer minor units plus a currency
@@ -89,3 +91,7 @@ The decisions worth knowing before reading the code, all detailed in the plan:
 - **Idempotency** claims a key with `ON CONFLICT DO NOTHING` in the *same*
   transaction as the ledger writes, so a crashed request leaves no half-claimed
   state and there are no stale rows to garbage-collect — see plan §6.2.
+- **The outbox** event is written in that same transaction, so an event can never
+  describe a transfer that did not happen and a transfer can never happen
+  without its event. Delivery is at-least-once with a stable `event_id`, so
+  consumers deduplicate on it — see plan §8.

@@ -14,6 +14,7 @@ import (
 	"github.com/EmersonAraki/go-ledger/internal/config"
 	"github.com/EmersonAraki/go-ledger/internal/httpapi"
 	"github.com/EmersonAraki/go-ledger/internal/ledger"
+	"github.com/EmersonAraki/go-ledger/internal/outbox"
 	"github.com/EmersonAraki/go-ledger/internal/storage/postgres"
 )
 
@@ -41,9 +42,25 @@ func run() error {
 	}
 	defer pool.Close()
 
+	store := postgres.NewStore(pool)
+	publisher := outbox.LogPublisher{}
+
+	// The relay runs in-process by default so a single binary is a complete,
+	// working system. cmd/relay runs the same loop standalone when delivery
+	// needs to scale independently of the API; SKIP LOCKED means both can run at
+	// once without coordination.
+	relay := outbox.NewRelay(store, publisher, outbox.RelayOptions{})
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		if err := relay.Run(ctx); err != nil {
+			slog.Error("outbox relay exited", "error", err)
+		}
+	}()
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewServer(pool, ledger.NewService(postgres.NewStore(pool))).Routes(),
+		Handler:           httpapi.NewServer(pool, ledger.NewService(store), store, publisher).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		// Bounds reading the request body. This must grow before the
 		// reconciliation endpoint starts accepting large CSV uploads.
@@ -77,6 +94,15 @@ func run() error {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return err
 	}
+
+	// The relay stops on the same cancelled context; wait for its current batch
+	// so a shutdown cannot abandon a transaction mid-publish.
+	select {
+	case <-relayDone:
+	case <-shutdownCtx.Done():
+		slog.Warn("outbox relay did not stop before the shutdown deadline")
+	}
+
 	slog.Info("shutdown complete")
 	return nil
 }
