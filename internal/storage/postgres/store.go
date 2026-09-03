@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/EmersonAraki/go-ledger/internal/ledger"
+	"github.com/EmersonAraki/go-ledger/internal/outbox"
 )
 
 // Store is the PostgreSQL implementation of ledger.Repository. It is the only
@@ -60,7 +61,8 @@ func (s *Store) GetAccount(ctx context.Context, id uuid.UUID) (*ledger.Account, 
 }
 
 // Transfer claims the idempotency key and writes a two-leg transaction, both
-// balance updates and the rendered response -- all in one database transaction.
+// balance updates, the outbox event and the rendered response -- all in one
+// database transaction.
 //
 // Isolation: READ COMMITTED plus an explicit row lock on the two accounts,
 // taken in ascending id order. Ordering the lock acquisition is what makes
@@ -124,6 +126,17 @@ func (s *Store) Transfer(
 	}
 
 	if err := applyBalances(ctx, tx, cmd); err != nil {
+		return nil, err
+	}
+
+	// The outbox event is written in this same transaction. That is the entire
+	// point of the pattern: there is no window in which the money has moved but
+	// the event is missing, or the event exists but the money did not move.
+	event, err := outbox.NewTransactionCreated(result)
+	if err != nil {
+		return nil, err
+	}
+	if err := insertEvent(ctx, tx, &event); err != nil {
 		return nil, err
 	}
 

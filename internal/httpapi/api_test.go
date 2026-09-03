@@ -13,22 +13,32 @@ import (
 	"github.com/EmersonAraki/go-ledger/internal/httpapi"
 	"github.com/EmersonAraki/go-ledger/internal/idempotency"
 	"github.com/EmersonAraki/go-ledger/internal/ledger"
+	"github.com/EmersonAraki/go-ledger/internal/outbox"
 	"github.com/EmersonAraki/go-ledger/internal/platform/pgtest"
 	"github.com/EmersonAraki/go-ledger/internal/storage/postgres"
 )
 
 // testAPI is a live handler backed by a real, isolated database schema.
 type testAPI struct {
-	t       *testing.T
-	handler http.Handler
-	pool    *pgxpool.Pool
+	t         *testing.T
+	handler   http.Handler
+	pool      *pgxpool.Pool
+	store     *postgres.Store
+	publisher *outbox.RecordingPublisher
 }
 
 func newTestAPI(t *testing.T) *testAPI {
 	t.Helper()
 	pool := pgtest.Pool(t)
-	svc := ledger.NewService(postgres.NewStore(pool))
-	return &testAPI{t: t, handler: httpapi.NewServer(pool, svc).Routes(), pool: pool}
+	store := postgres.NewStore(pool)
+	publisher := &outbox.RecordingPublisher{}
+	return &testAPI{
+		t:         t,
+		handler:   httpapi.NewServer(pool, ledger.NewService(store), store, publisher).Routes(),
+		pool:      pool,
+		store:     store,
+		publisher: publisher,
+	}
 }
 
 // do issues a request with a fresh idempotency key, so ordinary tests never

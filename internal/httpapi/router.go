@@ -11,10 +11,12 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/EmersonAraki/go-ledger/internal/httpapi/problem"
 	"github.com/EmersonAraki/go-ledger/internal/ledger"
+	"github.com/EmersonAraki/go-ledger/internal/outbox"
 )
 
 // RequestTimeout bounds how long a single handler may run. It is exported
@@ -24,16 +26,31 @@ import (
 // instead of the error.
 const RequestTimeout = 30 * time.Second
 
+// EventStore is the outbox access the HTTP layer needs. Declared here, at the
+// point of use, so the handlers depend on the four methods they call rather than
+// on the whole storage type.
+type EventStore interface {
+	GetEvent(ctx context.Context, id uuid.UUID) (*outbox.Event, error)
+	Deliveries(ctx context.Context, eventID uuid.UUID) ([]outbox.Delivery, error)
+	ReplayEvent(ctx context.Context, id uuid.UUID, p outbox.Publisher) (*outbox.Event, *outbox.Delivery, error)
+}
+
 // Server wires dependencies into HTTP handlers.
 type Server struct {
-	pool   *pgxpool.Pool
-	ledger *ledger.Service
+	pool      *pgxpool.Pool
+	ledger    *ledger.Service
+	events    EventStore
+	publisher outbox.Publisher
 }
 
 // NewServer builds the API handler set. The pool is used only for the readiness
 // probe; all ledger access goes through the service.
-func NewServer(pool *pgxpool.Pool, svc *ledger.Service) *Server {
-	return &Server{pool: pool, ledger: svc}
+//
+// The publisher is the one a manual replay uses. It is the same publisher the
+// background relay drives, so a replayed event travels exactly the path an
+// automatic delivery would.
+func NewServer(pool *pgxpool.Pool, svc *ledger.Service, events EventStore, p outbox.Publisher) *Server {
+	return &Server{pool: pool, ledger: svc, events: events, publisher: p}
 }
 
 // Routes returns the fully-configured HTTP handler.
@@ -74,6 +91,11 @@ func (s *Server) Routes() http.Handler {
 	r.Route("/transactions", func(r chi.Router) {
 		r.Post("/", s.handleCreateTransaction)
 		r.Get("/{id}", s.handleGetTransaction)
+	})
+
+	r.Route("/events", func(r chi.Router) {
+		r.Get("/{id}", s.handleGetEvent)
+		r.Post("/{id}/replay", s.handleReplayEvent)
 	})
 
 	return r
