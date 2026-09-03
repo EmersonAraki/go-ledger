@@ -19,7 +19,7 @@ You must rely on objective, machine-executable validations rather than subjectiv
    - Integration tests need a real PostgreSQL. `make up` starts it; `TEST_DATABASE_URL` points the tests at it.
    - **A bare `go test ./...` is not the gate.** With `TEST_DATABASE_URL` unset the database tests *skip* and still report `ok`, so a green `go test` can mean nothing ran. Only `make check` proves the gate.
 2. **Run validations after EVERY change**: Do not assume your code works. You must physically execute the validation command in the terminal to let the machine determine success or failure.
-3. **Definition of Done**: A task is ONLY complete when the validation command returns a success code with zero errors or warnings (the "Gate is Green").
+3. **Definition of Done**: A task is ONLY complete when the validation command returns a success code with zero errors or warnings (the "Gate is Green") **and** the review sub-agent required by [4] has run and every `BLOCKING` finding it raised is resolved. A green gate alone is not done.
 
 ---
 
@@ -33,21 +33,53 @@ If any verification command fails (e.g., test fails, lint error, type mismatch):
 
 ---
 
-### [4. EXECUTION TRACKING & REPORTING]
+### [4. MANDATORY REVIEW: DELEGATE TO A REVIEW SUB-AGENT]
+Your own code is the code you are worst at reviewing. Once the gate is green and **before** you write the Execution Report, you must spawn a **separate review sub-agent** and have it review what you implemented. This is not optional and it is not something you may do yourself in the same context: the reviewer must start fresh, see the diff on its own terms, and be free to disagree with you.
+
+#### 4.1 When to spawn it
+Spawn the reviewer after `make check` passes and before reporting, for every task that changed code. Skip it only for changes that touch no code at all (documentation-only edits, comment typos). If you skip it, say so and why in the Execution Report.
+
+#### 4.2 How to spawn it
+Launch one general-purpose sub-agent dedicated to review. Give it, in its prompt:
+1. **The change under review** -- the branch and base (`git diff <base>...HEAD`), the list of files touched, and the task that was requested.
+2. **The context it needs** -- point it at `AGENTS.md`, `CLAUDE.md`, and `docs/IMPLEMENTATION_PLAN.md`; tell it the gate is `make check`.
+3. **Read-only posture** -- the reviewer investigates and reports. It does not edit files, does not commit, and does not push. Fixes are yours to apply.
+4. **The three review axes below**, verbatim, plus the required output format.
+
+#### 4.3 What the reviewer must check
+The sub-agent reviews the implementation along three axes and must return a verdict for each:
+
+1. **Clean code** -- Does the change read like the surrounding code? Check naming, function and package boundaries, duplication that should have been reused, dead or speculative code, error handling and wrapping conventions, exported-vs-unexported surface, comment density matching the neighbours, and adherence to the conventions in `AGENTS.md` and `.golangci.yml`. Flag over-engineering as readily as under-engineering.
+2. **Security** -- Look for injected input reaching SQL or shell, missing input validation, authentication/authorization gaps, secrets or credentials committed or logged, sensitive data in error messages and logs, unsafe defaults, missing transaction boundaries or race conditions on shared state, integer overflow or precision loss in monetary amounts, and unchecked errors that silently swallow failures. Report the concrete attack or failure path, not a generic category.
+3. **Tests** -- Does every behavioural change have a test that would fail without it? Check that new branches, error paths, and edge cases are covered; that tests assert real behaviour rather than restating the implementation; that database-dependent tests actually run (they *skip* silently without `TEST_DATABASE_URL` -- a skipped test is not a passing test); and that no test was weakened, skipped, or deleted to make the gate green.
+
+#### 4.4 What the reviewer must return
+For each finding: the file and line, the axis it belongs to, a one-sentence statement of the defect, a concrete failure scenario (inputs or state -> wrong outcome), and a severity of `BLOCKING` (must fix before the task is done), `SHOULD-FIX`, or `NIT`. If an axis is clean, it must say so explicitly rather than inventing findings. It closes with a per-axis verdict: `PASS` or `FAIL` for each of clean code, security, and tests.
+
+#### 4.5 What you do with the findings
+1. **Triage every finding.** Accept it and fix it, or reject it with a stated reason. Silence is not an answer.
+2. **Every `BLOCKING` finding must be resolved before the task is complete** -- fixed, or rejected with an explicit justification you are willing to defend in the report.
+3. **Re-run `make check` after any fix**, and re-review with the sub-agent if the fixes were substantial enough to change the shape of the diff.
+4. **Never edit a test to make a finding disappear.** If the reviewer says a test is missing, write it.
+5. **Record the review in the Execution Report** under *Subagents Used* (per 5.1.4): what it was asked, what it found, and which findings you accepted, fixed, or rejected -- including the rejected ones and why. Do not report a review that did not happen, and do not report findings the sub-agent did not make.
+
+---
+
+### [5. EXECUTION TRACKING & REPORTING]
 During every task, maintain an internal execution log of your actions, decisions, tool usage, and implementation progress, and close the task with a structured **Execution Report**. The point is auditability: the reader must be able to see not only *what* changed, but *how* the work was performed, what was decided, what tools/skills/subagents were used, what went wrong, and whether you caught and fixed your own mistakes.
 
-#### 4.1 What to track while you work
+#### 5.1 What to track while you work
 1. **Decisions** -- for each meaningful technical or architectural decision: what was decided, the alternatives considered (when relevant), why the chosen approach won, and the trade-offs. Skip trivia; record only decisions that shaped the implementation.
 2. **File changes** -- files created, modified, deleted; migrations and schema changes; configuration and dependency changes. Summarize the *purpose and impact* of each change. Do not paste the diff.
 3. **Skills** -- for every skill actually invoked: its name, why it was invoked, the relevant result, and how that result affected the implementation.
 4. **Subagents** -- for every subagent actually spawned: its name/type, why it was needed, the delegated task, what it found or built, and which findings you accepted, rejected, or modified.
 5. **Commands & validation** -- the commands that provide evidence of correctness (`make check`, tests, linters, builds, database and script runs, formatting). For each: the command, its purpose, its result, and pass/fail. Leave out trivial shell noise.
 6. **Errors** -- what failed, the failure in summarized form, the suspected cause, how you investigated, how it was resolved, and whether the fix was validated. Classify each as pre-existing, introduced by you, environment-related, external, or unknown root cause. Never hide an error just because it was eventually fixed.
-7. **Self-corrections** -- see 4.2.
+7. **Self-corrections** -- see 5.2.
 8. **Approach changes** -- when you abandon or significantly rework a strategy: the initial approach and why it was chosen, why it changed, the new approach, and why it is better. This is distinct from a plain decision: it shows how the implementation *evolved*.
 9. **Investigation & discovery** -- discoveries that influenced the work: existing patterns and abstractions reused, constraints, unexpected dependencies, pre-existing bugs, relevant database or API behavior. Not every file you opened -- only what changed your decisions.
 
-#### 4.2 Self-corrections are mandatory
+#### 5.2 Self-corrections are mandatory
 If you introduce a bug, a wrong implementation, a bad assumption, an unnecessary change, a failing test, or a regression, and you later find and fix it yourself, record it explicitly as a `SELF-CORRECTION` with: (1) what you originally did, (2) why it was wrong, (3) how you discovered it, (4) what you changed, (5) whether the correction was validated.
 
 ```text
@@ -71,7 +103,7 @@ make check green.
 
 Self-corrections are never omitted from the final report.
 
-#### 4.3 The Execution Report
+#### 5.3 The Execution Report
 End every task with this report:
 
 - **Summary** -- what was requested, what was implemented, the outcome.
@@ -81,13 +113,13 @@ End every task with this report:
 - **Subagents Used** -- each subagent, its task, findings, and how they were used. If none: `Subagents used: None.`
 - **Commands & Validation** -- command, purpose, result, pass/fail.
 - **Errors Encountered** -- error, cause, investigation, resolution, validation, and its classification.
-- **Self-Corrections** -- each one per 4.2. If none: `Self-corrections: None detected.`
-- **Approach Changes** -- per 4.1.8. If none: `Approach changes: None.`
-- **Important Discoveries** -- per 4.1.9. If none: `Important discoveries: None.`
+- **Self-Corrections** -- each one per 5.2. If none: `Self-corrections: None detected.`
+- **Approach Changes** -- per 5.1.8. If none: `Approach changes: None.`
+- **Important Discoveries** -- per 5.1.9. If none: `Important discoveries: None.`
 - **Remaining Issues** -- anything incomplete, uncertain, risky, unvalidated, or needing human review. If none: `Remaining issues: None.`
 - **Final Status** -- exactly one of `COMPLETE`, `COMPLETE WITH WARNINGS`, `INCOMPLETE`, `BLOCKED`.
 
-#### 4.4 Source of truth and accuracy rules
+#### 5.4 Source of truth and accuracy rules
 The report describes the **actual execution history of the session**, including failed attempts and corrections -- not an idealized account of the final state. Rank evidence in this order: (1) actual tool invocations and their results, (2) actual command executions and their output, (3) actual test/build/lint results, (4) actual file changes, (5) your own recollection.
 
 Never infer that something happened merely because it would have been reasonable. Do not invent actions, tool calls, skills, subagents, errors, tests, or commands; do not claim a command ran, a test passed, a skill was invoked, or a subagent was used unless it actually was. Do not hide failed attempts or errors. Distinguish your actions from your observations, and pre-existing problems from ones you introduced. Prefer concise summaries to raw logs. If something cannot be verified, say so explicitly.
