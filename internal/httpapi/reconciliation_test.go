@@ -573,3 +573,101 @@ func TestReconcileReportsTransactionsItCannotExpress(t *testing.T) {
 		}
 	}
 }
+
+// The cursor POST hands back must mean the same thing GET expects. GET paginates
+// on the database row id; discrepancy ids come from a global sequence, so the
+// Nth finding of a run is not row id N. A cursor that conflates the two makes a
+// client re-receive findings it already has.
+func TestPostCursorIsUsableAgainstGet(t *testing.T) {
+	t.Parallel()
+	api := newTestAPI(t)
+
+	alice := api.createAccount("alice", "BRL", false)
+	bob := api.createAccount("bob", "BRL", false)
+	api.fund(alice, "BRL", 100_000)
+
+	// A first run, purely to advance the shared id sequence so that the second
+	// run's row ids cannot coincide with its own 1..N ordinals.
+	first := csvHeader
+	for i := range 5 {
+		first += fmt.Sprintf("PRIOR-%d,2026-09-01T10:00:00Z,%s,%s,%d,BRL\n", i, bob, alice, 10+i)
+	}
+	if rec := api.uploadStatement("prior.csv", first); rec.Code != http.StatusCreated {
+		t.Fatalf("first upload: status %d, body %s", rec.Code, rec.Body)
+	}
+
+	// A second run with more findings than one page.
+	second := csvHeader
+	for i := range 150 {
+		second += fmt.Sprintf("GHOST-%d,2026-09-02T10:00:00Z,%s,%s,%d,BRL\n", i, bob, alice, 1000+i)
+	}
+	rec := api.uploadStatement("many.csv", second)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("second upload: status %d, body %s", rec.Code, rec.Body)
+	}
+
+	var run runBody
+	api.decode(rec, &run)
+	if run.NextCursor == nil {
+		t.Fatalf("expected a truncated POST response with a cursor; got %d findings",
+			len(run.Discrepancies))
+	}
+
+	// Walk from POST's cursor through GET, collecting what the client would see.
+	seen := map[string]int{}
+	key := func(d struct {
+		Kind          string         `json:"kind"`
+		StatementRef  *string        `json:"statement_ref"`
+		TransactionID *string        `json:"transaction_id"`
+		Details       map[string]any `json:"details"`
+	}) string {
+		ref := ""
+		if d.StatementRef != nil {
+			ref = *d.StatementRef
+		}
+		return fmt.Sprintf("%s|%s|%v", d.Kind, ref, d.Details["line"])
+	}
+
+	for _, d := range run.Discrepancies {
+		seen[key(d)]++
+	}
+
+	cursor := *run.NextCursor
+	for page := 0; ; page++ {
+		if page > 30 {
+			t.Fatal("pagination did not terminate")
+		}
+		rec := api.do(http.MethodGet,
+			fmt.Sprintf("/reconciliation/%s?after=%d", run.ID, cursor), nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("page %d: status %d, body %s", page, rec.Code, rec.Body)
+		}
+		var p runBody
+		api.decode(rec, &p)
+		for _, d := range p.Discrepancies {
+			seen[key(d)]++
+		}
+		if p.NextCursor == nil {
+			break
+		}
+		cursor = *p.NextCursor
+	}
+
+	var duplicated int
+	for k, n := range seen {
+		if n > 1 {
+			duplicated++
+			if duplicated <= 3 {
+				t.Errorf("finding %q was delivered %d times", k, n)
+			}
+		}
+	}
+	if duplicated > 0 {
+		t.Errorf("%d findings were delivered more than once: POST's cursor does not "+
+			"mean what GET's does", duplicated)
+	}
+	if len(seen) != run.DiscrepancyCount {
+		t.Errorf("client saw %d distinct findings, run reports %d",
+			len(seen), run.DiscrepancyCount)
+	}
+}

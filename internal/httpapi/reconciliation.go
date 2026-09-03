@@ -134,8 +134,11 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	var next *int64
 	if len(shown) > defaultDiscrepancyPage {
 		shown = shown[:defaultDiscrepancyPage]
-		// Findings are stored in order, so the first page ends at the Nth row.
-		cursor := int64(defaultDiscrepancyPage)
+		// The cursor must be the stored row id of the last finding shown, not a
+		// count: GET paginates on id, and ids come from a shared sequence, so
+		// "the 100th finding of this run" and "row id 100" are different rows
+		// for every run after the first.
+		cursor := shown[len(shown)-1].ID
 		next = &cursor
 	}
 	writeJSON(w, http.StatusCreated, newRunResponse(run, shown, next))

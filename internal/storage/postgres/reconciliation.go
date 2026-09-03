@@ -271,14 +271,20 @@ func (s *Store) saveRun(ctx context.Context, run *reconcile.Run) error {
 		if err != nil {
 			return fmt.Errorf("marshal discrepancy %d details: %w", i, err)
 		}
-		_, err = tx.Exec(ctx, `
+		var id int64
+		err = tx.QueryRow(ctx, `
 			INSERT INTO reconciliation_discrepancies
 			    (run_id, kind, statement_ref, transaction_id, details)
-			VALUES ($1, $2, $3, $4, $5)`,
-			run.ID, d.Kind, d.StatementRef, d.TransactionID, details)
+			VALUES ($1, $2, $3, $4, $5)
+			RETURNING id`,
+			run.ID, d.Kind, d.StatementRef, d.TransactionID, details,
+		).Scan(&id)
 		if err != nil {
 			return fmt.Errorf("insert discrepancy %d: %w", i, err)
 		}
+		// Rows are inserted in slice order, so these ids ascend in the same order
+		// GET returns them, and a cursor taken from one is valid for the other.
+		run.Discrepancies[i].ID = id
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -345,6 +351,7 @@ func (s *Store) ListDiscrepancies(ctx context.Context, runID uuid.UUID,
 		if err := rows.Scan(&id, &d.Kind, &d.StatementRef, &d.TransactionID, &details); err != nil {
 			return nil, 0, false, fmt.Errorf("scan discrepancy: %w", err)
 		}
+		d.ID = id
 		// UseNumber, not a plain Unmarshal: decoding into map[string]any turns
 		// every JSON number into a float64, which silently rounds the int64
 		// amounts these details carry. The POST response marshals straight from

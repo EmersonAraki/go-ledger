@@ -99,6 +99,11 @@ const (
 
 // Discrepancy is one disagreement worth an operator's attention.
 type Discrepancy struct {
+	// ID is the stored row's identifier, assigned on save. It is what
+	// pagination cursors are expressed in: the ids come from a shared sequence,
+	// so the Nth finding of a run is NOT row id N, and a cursor that conflates
+	// the two makes a client re-receive findings it already has.
+	ID   int64
 	Kind string
 	// StatementRef is the external reference involved, when there is one.
 	StatementRef *string
