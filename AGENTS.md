@@ -34,40 +34,62 @@ If any verification command fails (e.g., test fails, lint error, type mismatch):
 ---
 
 ### [4. EXECUTION TRACKING & REPORTING]
-During every task, maintain an internal execution log of your actions, decisions, tool usage, and implementation progress. At the end of the task, provide a structured execution report.
+During every task, maintain an internal execution log of your actions, decisions, tool usage, and implementation progress, and close the task with a structured **Execution Report**. The point is auditability: the reader must be able to see not only *what* changed, but *how* the work was performed, what was decided, what tools/skills/subagents were used, what went wrong, and whether you caught and fixed your own mistakes.
 
-The purpose of this report is to make the work auditable and transparent: not only WHAT changed, but HOW the work was performed, what decisions were made, what tools, skills, and subagents were used, what went wrong, how the implementation evolved, and whether you detected and corrected your own mistakes.
+#### 4.1 What to track while you work
+1. **Decisions** -- for each meaningful technical or architectural decision: what was decided, the alternatives considered (when relevant), why the chosen approach won, and the trade-offs. Skip trivia; record only decisions that shaped the implementation.
+2. **File changes** -- files created, modified, deleted; migrations and schema changes; configuration and dependency changes. Summarize the *purpose and impact* of each change. Do not paste the diff.
+3. **Skills** -- for every skill actually invoked: its name, why it was invoked, the relevant result, and how that result affected the implementation.
+4. **Subagents** -- for every subagent actually spawned: its name/type, why it was needed, the delegated task, what it found or built, and which findings you accepted, rejected, or modified.
+5. **Commands & validation** -- the commands that provide evidence of correctness (`make check`, tests, linters, builds, database and script runs, formatting). For each: the command, its purpose, its result, and pass/fail. Leave out trivial shell noise.
+6. **Errors** -- what failed, the failure in summarized form, the suspected cause, how you investigated, how it was resolved, and whether the fix was validated. Classify each as pre-existing, introduced by you, environment-related, external, or unknown root cause. Never hide an error just because it was eventually fixed.
+7. **Self-corrections** -- see 4.2.
+8. **Approach changes** -- when you abandon or significantly rework a strategy: the initial approach and why it was chosen, why it changed, the new approach, and why it is better. This is distinct from a plain decision: it shows how the implementation *evolved*.
+9. **Investigation & discovery** -- discoveries that influenced the work: existing patterns and abstractions reused, constraints, unexpected dependencies, pre-existing bugs, relevant database or API behavior. Not every file you opened -- only what changed your decisions.
 
-**1. Track Decisions** — for each meaningful technical or architectural decision record what was decided, what alternatives were considered, why the chosen approach won, and the trade-offs. Do not report trivial implementation details as decisions.
+#### 4.2 Self-corrections are mandatory
+If you introduce a bug, a wrong implementation, a bad assumption, an unnecessary change, a failing test, or a regression, and you later find and fix it yourself, record it explicitly as a `SELF-CORRECTION` with: (1) what you originally did, (2) why it was wrong, (3) how you discovered it, (4) what you changed, (5) whether the correction was validated.
 
-**2. Track File Changes** — files created, modified, deleted; migrations; schema changes; configuration changes; dependency changes. Summarize the purpose and impact of each change rather than reproducing the diff.
+```text
+SELF-CORRECTION
 
-**3. Track Skills** — for each skill invoked record its name, why it was invoked, the relevant result, and how it affected the implementation. If none were used, state `Skills used: None.` Never claim a skill was used if it was not actually invoked.
+Original implementation:
+Added validation X to Model Y.
 
-**4. Track Subagents** — for each subagent record its type, why it was needed, the task delegated, what it found or built, and which findings were accepted, rejected, or modified. If none were used, state `Subagents used: None.` Never claim a subagent was used if it was not actually invoked.
+Problem:
+The validation also affected existing records and broke unrelated tests.
 
-**5. Track Commands and Validation** — record important commands (tests, linters, type checks, builds, database commands, scripts, formatters) with the command, its purpose, its result, and pass/fail. Prioritize commands that provide evidence about correctness; omit trivial noise.
+Discovery:
+Test failures after the change.
 
-**6. Track Errors** — for each error record what failed, the error in summary, the suspected cause, how it was investigated, how it was resolved, and whether the fix was validated. Distinguish pre-existing, agent-introduced, environment-related, external-dependency, and unknown-cause errors. Do not hide errors merely because they were eventually fixed.
+Correction:
+Scoped the validation so it only runs when condition Z holds.
 
-**7. Explicitly Track Self-Corrections** — this matters most. If you introduce a bug, wrong implementation, bad assumption, unnecessary change, failing test, or regression and later find and fix it yourself, record it as a `SELF-CORRECTION` with: what you originally did, why it was wrong, how you discovered it, what you changed, and whether the correction was validated. Never omit self-corrections.
+Validation:
+make check green.
+```
 
-**8. Track Changes of Approach** — if you abandon or significantly rework a strategy, record the initial approach, why it was chosen, why it changed, the new approach, and why it is preferred. This shows how the implementation evolved, which is distinct from a normal decision.
+Self-corrections are never omitted from the final report.
 
-**9. Track Investigation and Discovery** — record discoveries that influenced the implementation: existing patterns, reusable abstractions, pre-existing bugs, constraints, unexpected dependencies, important database or API behavior. Do not document every file you opened.
+#### 4.3 The Execution Report
+End every task with this report:
 
-#### Final Execution Report
+- **Summary** -- what was requested, what was implemented, the outcome.
+- **Decisions** -- the meaningful decisions and their reasoning.
+- **Changes** -- the important files and changes, each with its purpose.
+- **Skills Used** -- each skill, why, and its effect. If none: `Skills used: None.`
+- **Subagents Used** -- each subagent, its task, findings, and how they were used. If none: `Subagents used: None.`
+- **Commands & Validation** -- command, purpose, result, pass/fail.
+- **Errors Encountered** -- error, cause, investigation, resolution, validation, and its classification.
+- **Self-Corrections** -- each one per 4.2. If none: `Self-corrections: None detected.`
+- **Approach Changes** -- per 4.1.8. If none: `Approach changes: None.`
+- **Important Discoveries** -- per 4.1.9. If none: `Important discoveries: None.`
+- **Remaining Issues** -- anything incomplete, uncertain, risky, unvalidated, or needing human review. If none: `Remaining issues: None.`
+- **Final Status** -- exactly one of `COMPLETE`, `COMPLETE WITH WARNINGS`, `INCOMPLETE`, `BLOCKED`.
 
-Produce these sections, in order: **Summary** (what was requested, what was implemented, the outcome) · **Decisions** · **Changes** · **Skills Used** · **Subagents Used** · **Commands & Validation** · **Errors Encountered** (tagged pre-existing / agent-introduced / environment / external / unknown) · **Self-Corrections** (`Self-corrections: None detected.` if none) · **Approach Changes** (`Approach changes: None.` if none) · **Important Discoveries** (`Important discoveries: None.` if none) · **Remaining Issues** (`Remaining issues: None.` if none) · **Final Status**.
+#### 4.4 Source of truth and accuracy rules
+The report describes the **actual execution history of the session**, including failed attempts and corrections -- not an idealized account of the final state. Rank evidence in this order: (1) actual tool invocations and their results, (2) actual command executions and their output, (3) actual test/build/lint results, (4) actual file changes, (5) your own recollection.
 
-Final Status is exactly one of: `COMPLETE` (finished, validation passed) · `COMPLETE WITH WARNINGS` (finished, with known warnings, limitations, or unvalidated areas) · `INCOMPLETE` (could not be fully completed) · `BLOCKED` (external dependency or blocker).
+Never infer that something happened merely because it would have been reasonable. Do not invent actions, tool calls, skills, subagents, errors, tests, or commands; do not claim a command ran, a test passed, a skill was invoked, or a subagent was used unless it actually was. Do not hide failed attempts or errors. Distinguish your actions from your observations, and pre-existing problems from ones you introduced. Prefer concise summaries to raw logs. If something cannot be verified, say so explicitly.
 
-#### Source of Truth
-
-The report must describe the actual execution history of the session, in this order of reliability: (1) actual tool invocations and their results, (2) actual command executions and their output, (3) actual test, build, and linter results, (4) actual file changes, (5) agent reasoning and recollection.
-
-Never infer that an action happened merely because it would have been reasonable. Report skills, subagents, errors, commands, file changes, decisions, tests, and self-corrections only when verifiable from the actual execution context. Describe the real history, including failed attempts and corrections, not an idealized account of the final state.
-
-**Accuracy rules.** Be factual. Do not invent actions, tool calls, skills, subagents, errors, or tests. Do not claim a command was executed, a test passed, a skill was used, or a subagent was invoked unless it actually was. Do not hide failed attempts or errors that were later fixed. Distinguish agent actions from observations, and pre-existing problems from ones introduced by the current work. Prefer concise summaries over raw logs. If something cannot be verified, say so explicitly.
-
-The final execution report must be generated before considering the task complete.
+The Execution Report must be produced before the task is considered complete.
