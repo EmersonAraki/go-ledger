@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -19,22 +20,36 @@ const timeFormat = "2006-01-02T15:04:05.000Z"
 // object; an unbounded reader is a denial-of-service invitation.
 const maxRequestBody = 1 << 20 // 1 MiB
 
-// decodeJSON reads a JSON request body into dst, writing a problem+json
-// response and returning false if it cannot. Unknown fields are rejected: a
-// client that misspells "amount" should be told, not silently credited zero.
-func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+// readJSONBody reads the whole request body into memory, bounded, writing a
+// problem+json response and returning false if it cannot.
+//
+// The bytes are kept rather than streamed because the idempotency fingerprint
+// has to hash exactly what the client sent, and a decoder consumes the reader.
+func readJSONBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-
-	if err := dec.Decode(dst); err != nil {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			problem.Write(w, http.StatusRequestEntityTooLarge, "request_too_large",
 				"Request Too Large", "request body exceeds 1 MiB")
-			return false
+			return nil, false
 		}
+		problem.Write(w, http.StatusBadRequest, "invalid_request", "Invalid Request",
+			"could not read request body")
+		return nil, false
+	}
+	return body, true
+}
+
+// unmarshalJSON parses body into dst. Unknown fields are rejected: a client that
+// misspells "amount" should be told, not silently credited zero.
+func unmarshalJSON(w http.ResponseWriter, body []byte, dst any) bool {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(dst); err != nil {
 		problem.Write(w, http.StatusBadRequest, "invalid_json", "Invalid JSON", err.Error())
 		return false
 	}
@@ -47,6 +62,16 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	return true
+}
+
+// decodeJSON reads and parses a request body for handlers that do not need the
+// raw bytes.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	body, ok := readJSONBody(w, r)
+	if !ok {
+		return false
+	}
+	return unmarshalJSON(w, body, dst)
 }
 
 // parseUUIDField parses a UUID carried in a request body field.

@@ -208,7 +208,9 @@ CREATE TABLE idempotency_keys (
     endpoint        text        NOT NULL,   -- 'POST /transactions'
     request_hash    bytea       NOT NULL,   -- SHA-256 of the canonical request
     response_status int,
-    response_body   jsonb,
+    -- json, not jsonb: jsonb sorts keys and reformats whitespace, so a replayed
+    -- response would not be byte-identical to the original (migration 0002).
+    response_body   json,
     transaction_id  uuid REFERENCES transactions(id),
     created_at      timestamptz NOT NULL DEFAULT now(),
     expires_at      timestamptz NOT NULL DEFAULT now() + interval '24 hours',
@@ -560,7 +562,7 @@ Each phase ends on a green `make check` (lint + `go test -race ./...`) and its o
 | 0 | Scaffolding | **Done.** Module, layout, `docker-compose.yml` (postgres, redis), `Makefile`, golangci-lint, GitHub Actions CI, `/healthz` + `/readyz`, graceful shutdown | `make check` green; server boots, serves both probes, and exits cleanly on SIGTERM |
 | 1 | Schema | **Done.** Migration `0001_init`, `cmd/migrate` (up/down/version), `pgtest` schema-per-test helper | `migrate up` is idempotent and `down`/`up` round-trips; 8 tests cover the deferred trigger, balance floor, and partial unique index |
 | 2 | Accounts + transactions | **Done.** `POST/GET /accounts`, `POST/GET /transactions` (no idempotency yet), problem+json errors, `internal/ledger` domain layer | Integration tests cover happy path, unknown account, currency mismatch, non-positive and self transfer, insufficient funds, duplicate `external_ref`, malformed body/UUID; every test asserts the ledger still sums to zero |
-| 3 | Idempotency | Middleware + `internal/idempotency`, fingerprinting, full response matrix (§6.3) | Every row of the §6.3 matrix has a test |
+| 3 | Idempotency | **Done.** `internal/idempotency` (key validation, canonical fingerprint), single-transaction claim in the store, full response matrix (§6.3) | Every row of the §6.3 matrix has a test, plus the §7.2 concurrency proof: 30 racing identical requests, exactly one execution |
 | 4 | Double-entry hardening | Reversal endpoint, account statement endpoint, balance-drift check. **Ordered `FOR UPDATE` locking, the balance floor and the materialized balance moved into phase 2** — shipping a money-transfer endpoint with a known write-skew race, when the fix is a few lines already designed in §7.1, was not defensible | `SUM(signed_amount) = 0` holds after every test in the suite |
 | 5 | Concurrency proof | The two tests in §7.2 + a `SERIALIZABLE` vs `READ COMMITTED + FOR UPDATE` benchmark | Both tests pass under `-race`; ADR 0001 written with the numbers |
 | 6 | Outbox + replay | Envelope, store, relay with `SKIP LOCKED` + backoff, `POST /events/{id}/replay` | Golden-file envelope test; a test with two relay instances proves no double publish; replay produces a second delivery row with one `event_id` |

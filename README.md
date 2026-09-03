@@ -10,16 +10,15 @@ database enforces it.
 ## Status
 
 Phases 0-2 of [the implementation plan](docs/IMPLEMENTATION_PLAN.md) are
-complete: scaffolding, the schema with its invariants under test, and the
-accounts and transactions endpoints. Idempotency (phase 3) is next -- until then
-`POST /transactions` is not safe to retry, since a repeated request posts a
-second transfer.
+complete: scaffolding, the schema with its invariants under test, the accounts
+and transactions endpoints, and idempotent transfers. The outbox and event
+replay (phase 6) are next.
 
 | Method | Path | |
 | --- | --- | --- |
 | `POST` | `/accounts` | Create an account (always starts at zero) |
 | `GET` | `/accounts/{id}` | Balance and details |
-| `POST` | `/transactions` | Transfer between two accounts |
+| `POST` | `/transactions` | Transfer between two accounts (requires `Idempotency-Key`) |
 | `GET` | `/transactions/{id}` | Transaction with both legs |
 | `GET` | `/healthz`, `/readyz` | Liveness, readiness |
 
@@ -27,6 +26,12 @@ Money crosses the wire as integer minor units plus a currency
 (`{"amount": 12345, "currency": "BRL"}` is R$123.45) -- never a float.
 In `POST /transactions` the money ends up in `debit_account_id`, funded by
 `credit_account_id`; the names follow accounting, not banking.
+
+`POST /transactions` requires an `Idempotency-Key` header and is safe to retry.
+A repeat of the same request returns the original response byte-for-byte with
+`Idempotency-Replayed: true` and does no new work; the same key with a different
+payload is refused with `422`. A request that fails does not consume its key, so
+a client can fix the payload and retry with the same one.
 
 ## Quick start
 

@@ -17,10 +17,15 @@ type Repository interface {
 	// GetAccount loads one account, returning ErrAccountNotFound when absent.
 	GetAccount(ctx context.Context, id uuid.UUID) (*Account, error)
 
-	// Transfer atomically writes the transaction, both entries and both balance
-	// updates, locking the two accounts in a deterministic order first. The
-	// whole thing commits or none of it does.
-	Transfer(ctx context.Context, cmd TransferCommand) (*Transaction, error)
+	// Transfer atomically claims the idempotency key, writes the transaction,
+	// both entries and both balance updates, and stores the rendered response --
+	// locking the two accounts in a deterministic order first. The whole thing
+	// commits or none of it does.
+	//
+	// On a duplicate request it returns the stored response instead of doing the
+	// work again, and reports ErrIdempotencyKeyReuse if the key was first used
+	// for a different payload.
+	Transfer(ctx context.Context, cmd TransferCommand, claim Claim, render RenderFunc) (*Result, error)
 
 	// GetTransaction loads a transaction with its entries, returning
 	// ErrTransactionNotFound when absent.
@@ -66,31 +71,36 @@ func (s *Service) GetAccount(ctx context.Context, id uuid.UUID) (*Account, error
 	return s.repo.GetAccount(ctx, id)
 }
 
-// Transfer moves money between two accounts, writing both legs of the
-// double entry.
+// Transfer moves money between two accounts, writing both legs of the double
+// entry exactly once per idempotency key.
 //
 // Command-level rules are checked here; the rules that depend on account state
 // -- currency agreement and the balance floor -- are enforced inside the
 // repository's transaction, after the accounts have been locked. Checking those
 // here as well would be a lie: any value read before the lock can be stale by
 // the time the write lands.
-func (s *Service) Transfer(ctx context.Context, cmd TransferCommand) (*Transaction, error) {
+//
+// Validation runs before the claim on purpose. A request that fails validation
+// must not consume the key: the client should be able to fix the payload and
+// retry with the same key.
+func (s *Service) Transfer(ctx context.Context, cmd TransferCommand, claim Claim, render RenderFunc) (*Result, error) {
 	if err := cmd.Validate(); err != nil {
 		return nil, err
 	}
 
-	tx, err := s.repo.Transfer(ctx, cmd)
+	result, err := s.repo.Transfer(ctx, cmd, claim, render)
 	if err != nil {
 		return nil, err
 	}
 
 	// The database enforces this with a deferred trigger, so reaching here with
 	// an unbalanced transaction should be impossible. Assert it anyway: a silent
-	// imbalance is the one bug this system must never ship.
-	if !tx.Balanced() {
-		return nil, fmt.Errorf("internal: transaction %s is not balanced", tx.ID)
+	// imbalance is the one bug this system must never ship. A replay did no
+	// work, so there is nothing to check.
+	if result.Transaction != nil && !result.Transaction.Balanced() {
+		return nil, fmt.Errorf("internal: transaction %s is not balanced", result.Transaction.ID)
 	}
-	return tx, nil
+	return result, nil
 }
 
 // GetTransaction returns a transaction with its entries.
