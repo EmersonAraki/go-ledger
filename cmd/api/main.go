@@ -60,10 +60,11 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewServer(pool, ledger.NewService(store), store, publisher).Routes(),
+		Handler:           httpapi.NewServer(pool, ledger.NewService(store), store, publisher, store).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
-		// Bounds reading the request body. This must grow before the
-		// reconciliation endpoint starts accepting large CSV uploads.
+		// Bounds reading the request body, sized for the small JSON bodies most
+		// endpoints take. The statement upload lifts this per-handler rather
+		// than every endpoint paying for one large one.
 		ReadTimeout: 15 * time.Second,
 		// Must exceed the handler timeout, so a timing-out handler still has an
 		// open connection to write its error response on.

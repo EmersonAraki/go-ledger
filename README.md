@@ -10,9 +10,11 @@ database enforces it.
 ## Status
 
 Phases 0-2 of [the implementation plan](docs/IMPLEMENTATION_PLAN.md) are
-complete, plus phase 6: scaffolding, the schema with its invariants under test,
-the accounts and transactions endpoints, idempotent transfers, and the
-transactional outbox with event replay. Reconciliation (phase 7) is next.
+complete, plus phases 6 and 7: scaffolding, the schema with its invariants under
+test, the accounts and transactions endpoints, idempotent transfers, the
+transactional outbox with event replay, and statement reconciliation. What
+remains are the smaller phase 4/5 leftovers (reversal and account statement
+endpoints) and the optional phase 8 extras.
 
 | Method | Path | |
 | --- | --- | --- |
@@ -22,6 +24,8 @@ transactional outbox with event replay. Reconciliation (phase 7) is next.
 | `GET` | `/transactions/{id}` | Transaction with both legs |
 | `GET` | `/events/{id}` | Outbox event, its envelope and delivery history |
 | `POST` | `/events/{id}/replay` | Re-publish an event |
+| `POST` | `/reconciliation` | Upload a CSV statement, get a discrepancy report |
+| `GET` | `/reconciliation/{id}` | A stored run, findings keyset-paginated |
 | `GET` | `/healthz`, `/readyz` | Liveness, readiness |
 
 Money crosses the wire as integer minor units plus a currency
@@ -68,6 +72,8 @@ still runs with no services up.
 | --- | --- |
 | `cmd/api` | HTTP server: wiring, graceful shutdown |
 | `cmd/migrate` | Schema migration CLI (`up`, `down [n]`, `version`) |
+| `cmd/relay` | Standalone outbox publisher, for scaling delivery out |
+| `cmd/driftsweep` | Scheduled full-ledger balance-drift check (exit 2 on drift) |
 | `internal/httpapi` | Routing, handlers, problem+json errors |
 | `internal/storage/postgres` | Migrations and all SQL |
 | `internal/platform/pgtest` | Isolated-schema test harness |
@@ -95,3 +101,8 @@ The decisions worth knowing before reading the code, all detailed in the plan:
   describe a transfer that did not happen and a transfer can never happen
   without its event. Delivery is at-least-once with a stable `event_id`, so
   consumers deduplicate on it — see plan §8.
+- **Reconciliation** is strictly read-only against the ledger: it reports
+  disagreements and never corrects them, because a correction is a reversing
+  transaction with its own audit trail. It reads under `REPEATABLE READ` so every
+  query sees one instant — the one place snapshot isolation is the right tool,
+  in contrast to the write path above — see plan §9.

@@ -38,7 +38,7 @@ type Account struct {
 	Currency string
 	// Balance is in minor units and is maintained transactionally alongside the
 	// entries. SUM(ledger_entries.signed_amount) remains the source of truth;
-	// reconciliation reports any drift between the two.
+	// cmd/driftsweep reports any drift between the two.
 	Balance int64
 	// AllowNegativeBalance marks a system account -- external funding, fees --
 	// that may carry a negative balance. Money has to enter the ledger from

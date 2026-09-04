@@ -1,0 +1,451 @@
+package postgres
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
+	"github.com/EmersonAraki/go-ledger/internal/reconcile"
+)
+
+// maxDiscrepancyPage bounds one page of findings.
+const maxDiscrepancyPage = 500
+
+// ErrRunNotFound means no reconciliation run has the given id.
+var ErrRunNotFound = errors.New("reconciliation run not found")
+
+// Reconcile compares a parsed statement against the ledger and stores the result.
+//
+// The comparison runs in a REPEATABLE READ, read-only transaction. This is the
+// one place in the system where snapshot isolation is exactly the right tool:
+// the job issues several queries -- the transactions in the window, then the
+// ones no statement row could ever claim -- and they must all observe the same
+// instant. Under READ COMMITTED a transfer committing between those queries
+// would appear in one and not the other, and the job would invent a discrepancy
+// that never existed.
+//
+// Note the contrast with the write path, which deliberately does NOT use
+// REPEATABLE READ: there, snapshot isolation fails to prevent write skew. Same
+// isolation level, opposite verdict, because the requirements differ.
+func (s *Store) Reconcile(
+	ctx context.Context,
+	sourceName string,
+	stmt reconcile.Statement,
+	opts reconcile.Options,
+) (*reconcile.Run, error) {
+	rows, parseErrors := stmt.Rows, stmt.Findings
+
+	// The window comes from the file's own dates, so it is attacker controlled.
+	// Reject an implausible span before opening a transaction: the query would
+	// otherwise load the entire ledger from a tiny upload.
+	if start, end := reconcile.Window(rows); start != nil && end != nil {
+		if span := end.Sub(*start); span > time.Duration(reconcile.MaxWindowDays)*24*time.Hour {
+			return nil, fmt.Errorf("%w: %.0f days, limit is %d",
+				reconcile.ErrWindowTooWide, span.Hours()/24, reconcile.MaxWindowDays)
+		}
+	}
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("begin reconciliation snapshot: %w", err)
+	}
+	// Read-only, so this only releases the snapshot.
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	start, end := reconcile.Window(rows)
+	// One cap for the whole run, derived from the rows the file actually held.
+	rowLimit := opts.LedgerRowsLimit(stmt.RowsRead)
+
+	ledger, ledgerFetched, err := loadLedgerWindow(ctx, tx, start, end, opts.DateTolerance, rowLimit)
+	if err != nil {
+		return nil, err
+	}
+	// One row beyond the cap was requested purely to detect the cap biting.
+	ledgerTruncated := ledgerFetched > rowLimit
+	if ledgerTruncated {
+		ledger = ledger[:rowLimit]
+	}
+
+	matched, discrepancies := reconcile.Match(rows, ledger, opts)
+
+	unreconcilable, examined, err := loadUnreconcilable(ctx, tx, start, end, rowLimit)
+	if err != nil {
+		return nil, err
+	}
+	unreconcilableTruncated := examined > rowLimit
+
+	// Rollback rather than commit: nothing was written, and the snapshot has
+	// served its purpose.
+	if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+		return nil, fmt.Errorf("release reconciliation snapshot: %w", err)
+	}
+
+	// Bound the statement comparison, which is the only part that scales with
+	// the upload. The unreconcilable-transaction findings are deliberately
+	// exempt and appended after: they are ledger integrity problems, and
+	// dropping them because a statement happened to be messy would silence the
+	// check precisely when the data is least trustworthy.
+	findingsLimit := opts.FindingsLimit()
+	capped := discrepancies
+	var droppedFindings int
+	if len(capped) > findingsLimit {
+		droppedFindings = len(capped) - findingsLimit
+		capped = capped[:findingsLimit]
+	}
+
+	all := make([]reconcile.Discrepancy, 0,
+		len(parseErrors)+len(capped)+len(unreconcilable)+3)
+	all = append(all, parseErrors...)
+	all = append(all, capped...)
+	all = append(all, unreconcilable...)
+
+	if droppedFindings > 0 {
+		all = append(all, reconcile.Discrepancy{
+			Kind: reconcile.KindFindingsTruncated,
+			Details: map[string]any{
+				"reason":       "too many findings to report individually",
+				"reported":     findingsLimit,
+				"unreported":   droppedFindings,
+				"max_findings": findingsLimit,
+			},
+		})
+	}
+	if ledgerTruncated {
+		all = append(all, reconcile.Discrepancy{
+			Kind: reconcile.KindLedgerTruncated,
+			Details: map[string]any{
+				"reason":     "the statement window holds more transactions than one comparison loads",
+				"max_loaded": rowLimit,
+			},
+		})
+	}
+	if unreconcilableTruncated {
+		all = append(all, reconcile.Discrepancy{
+			Kind: reconcile.KindUnreconcilableTruncated,
+			Details: map[string]any{
+				"reason":     "the integrity scan examined only the start of the statement window",
+				"max_loaded": rowLimit,
+			},
+		})
+	}
+
+	run := &reconcile.Run{
+		ID:               uuid.New(),
+		SourceName:       sourceName,
+		StatementRows:    stmt.RowsRead,
+		MatchedCount:     matched,
+		DiscrepancyCount: len(all),
+		WindowStart:      start,
+		WindowEnd:        end,
+		Discrepancies:    all,
+	}
+
+	if err := s.saveRun(ctx, run); err != nil {
+		return nil, err
+	}
+	return run, nil
+}
+
+// loadLedgerWindow reads the transactions the statement could plausibly be
+// talking about. The window is widened by the date tolerance so a transfer
+// posted just outside the statement's range can still be matched to a row
+// inside it, rather than being reported missing on both sides.
+func loadLedgerWindow(ctx context.Context, tx pgx.Tx, start, end *time.Time,
+	tolerance time.Duration, maxRows int) ([]reconcile.LedgerTransaction, int, error) {
+	if start == nil || end == nil {
+		return nil, 0, nil
+	}
+	if tolerance <= 0 {
+		tolerance = reconcile.DefaultDateTolerance
+	}
+
+	// One row per transaction, with its two legs folded in. Restricting to
+	// exactly two entries keeps the shape the statement format can express;
+	// a multi-leg transaction could not be represented on one statement line
+	// anyway, and silently flattening one would misreport it.
+	rows, err := tx.Query(ctx, `
+		SELECT t.id,
+		       t.external_ref,
+		       t.created_at,
+		       d.account_id AS debit_account_id,
+		       c.account_id AS credit_account_id,
+		       d.amount,
+		       t.currency
+		  FROM transactions t
+		  JOIN ledger_entries d ON d.transaction_id = t.id AND d.direction = 'debit'
+		  JOIN ledger_entries c ON c.transaction_id = t.id AND c.direction = 'credit'
+		 WHERE t.created_at BETWEEN $1::timestamptz - $3::interval
+		                        AND $2::timestamptz + $3::interval
+		   AND (SELECT COUNT(*) FROM ledger_entries e WHERE e.transaction_id = t.id) = 2
+		 ORDER BY t.created_at, t.id
+		 LIMIT $4`,
+		start.UTC(), end.UTC(), intervalOf(tolerance), maxRows+1)
+	if err != nil {
+		return nil, 0, fmt.Errorf("load ledger window: %w", err)
+	}
+	defer rows.Close()
+
+	var out []reconcile.LedgerTransaction
+	for rows.Next() {
+		var t reconcile.LedgerTransaction
+		if err := rows.Scan(&t.ID, &t.ExternalRef, &t.PostedAt,
+			&t.DebitAccountID, &t.CreditAccountID, &t.Amount, &t.Currency); err != nil {
+			return nil, 0, fmt.Errorf("scan ledger transaction: %w", err)
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("read ledger window: %w", err)
+	}
+
+	// The fetched count is returned rather than folded into a bool because it is
+	// the only evidence that the SQL LIMIT is doing anything. Truncating here as
+	// well would make a missing LIMIT invisible: the caller would slice to the
+	// same rows either way, and the bound would be untestable -- which is
+	// precisely how it went untested before.
+	return out, len(out), nil
+}
+
+// loadUnreconcilable finds transactions in the window that the statement format
+// cannot describe, so they can be reported instead of silently skipped by the
+// two-leg restriction in loadLedgerWindow.
+//
+// The window's transactions are limited BEFORE the leg count is computed, and
+// the count is a correlated subquery per transaction rather than an aggregate
+// over a join. This is not a stylistic choice. The previous form put a LIMIT
+// above `GROUP BY t.id HAVING COUNT(e.id) <> 2`, which bounds rows returned and
+// not work done: on a healthy ledger the HAVING rejects every group, so the
+// aggregate ran to completion over the whole window before the LIMIT could see
+// anything. Measured over 400k entries in a 366-day window -- reachable from a
+// two-row CSV -- that cost 440ms and returned nothing, worse than the
+// whole-ledger drift query this file removed for being too expensive.
+//
+// Restricting first turns it into an index scan over the capped set plus one
+// index-only probe per transaction: 5ms at the cap a two-row upload earns.
+func loadUnreconcilable(ctx context.Context, tx pgx.Tx, start, end *time.Time,
+	maxRows int) ([]reconcile.Discrepancy, int, error) {
+	if start == nil || end == nil {
+		return nil, 0, nil
+	}
+	if maxRows <= 0 {
+		maxRows = reconcile.MinLedgerWindowRows
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT q.id, q.currency, q.created_at, q.legs
+		  FROM (SELECT w.id,
+		               w.currency,
+		               w.created_at,
+		               -- Correlated, so each transaction is one index-only probe.
+		               -- A LEFT JOIN here would hash the whole entries table.
+		               (SELECT COUNT(*)
+		                  FROM ledger_entries e
+		                 WHERE e.transaction_id = w.id) AS legs
+		          FROM (SELECT t.id, t.currency, t.created_at
+		                  FROM transactions t
+		                 WHERE t.created_at BETWEEN $1 AND $2
+		                 ORDER BY t.created_at, t.id
+		                 LIMIT $3) w) q
+		 WHERE q.legs <> 2
+		 ORDER BY q.created_at, q.id`, start.UTC(), end.UTC(), maxRows)
+	if err != nil {
+		return nil, 0, fmt.Errorf("load unreconcilable transactions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []reconcile.Discrepancy
+	for rows.Next() {
+		var (
+			id       uuid.UUID
+			currency string
+			postedAt time.Time
+			legs     int
+		)
+		if err := rows.Scan(&id, &currency, &postedAt, &legs); err != nil {
+			return nil, 0, fmt.Errorf("scan unreconcilable transaction: %w", err)
+		}
+		txID := id
+		out = append(out, reconcile.Discrepancy{
+			Kind:          reconcile.KindUnreconcilableTransaction,
+			TransactionID: &txID,
+			Details: map[string]any{
+				"reason":    "transaction has a shape a two-column statement cannot express",
+				"legs":      legs,
+				"currency":  currency,
+				"posted_at": postedAt.UTC(),
+			},
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("read unreconcilable transactions: %w", err)
+	}
+	rows.Close()
+
+	// Whether the cap bit cannot be read off the rows above: the leg filter
+	// removes almost all of them, and on a healthy ledger it removes every one.
+	// So ask separately, one row past the cap -- a bounded index scan, and the
+	// only way to avoid reporting a partial scan as a complete one. Keeping the
+	// probe out of the query above matters: a findings query that read
+	// maxRows+1 would report a finding from a transaction it was capped short
+	// of examining.
+	var examined int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		  FROM (SELECT 1
+		          FROM transactions t
+		         WHERE t.created_at BETWEEN $1 AND $2
+		         ORDER BY t.created_at, t.id
+		         LIMIT $3) capped`,
+		start.UTC(), end.UTC(), maxRows+1).Scan(&examined); err != nil {
+		return nil, 0, fmt.Errorf("count unreconcilable scan window: %w", err)
+	}
+
+	return out, examined, nil
+}
+
+// saveRun persists the run and its discrepancies in one transaction, so a report
+// is never half-written.
+func (s *Store) saveRun(ctx context.Context, run *reconcile.Run) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin save run: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	err = tx.QueryRow(ctx, `
+		INSERT INTO reconciliation_runs
+		    (id, source_name, statement_rows, matched_count, discrepancy_count,
+		     window_start, window_end)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING created_at`,
+		run.ID, run.SourceName, run.StatementRows, run.MatchedCount,
+		run.DiscrepancyCount, run.WindowStart, run.WindowEnd,
+	).Scan(&run.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("insert reconciliation run: %w", err)
+	}
+
+	for i, d := range run.Discrepancies {
+		details, err := json.Marshal(d.Details)
+		if err != nil {
+			return fmt.Errorf("marshal discrepancy %d details: %w", i, err)
+		}
+		var id int64
+		err = tx.QueryRow(ctx, `
+			INSERT INTO reconciliation_discrepancies
+			    (run_id, kind, statement_ref, transaction_id, details)
+			VALUES ($1, $2, $3, $4, $5)
+			RETURNING id`,
+			run.ID, d.Kind, d.StatementRef, d.TransactionID, details,
+		).Scan(&id)
+		if err != nil {
+			return fmt.Errorf("insert discrepancy %d: %w", i, err)
+		}
+		// Rows are inserted in slice order, so these ids ascend in the same order
+		// GET returns them, and a cursor taken from one is valid for the other.
+		run.Discrepancies[i].ID = id
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit reconciliation run: %w", err)
+	}
+	return nil
+}
+
+// GetRun loads a run's summary.
+func (s *Store) GetRun(ctx context.Context, id uuid.UUID) (*reconcile.Run, error) {
+	var run reconcile.Run
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, source_name, statement_rows, matched_count, discrepancy_count,
+		       window_start, window_end, created_at
+		  FROM reconciliation_runs WHERE id = $1`, id,
+	).Scan(&run.ID, &run.SourceName, &run.StatementRows, &run.MatchedCount,
+		&run.DiscrepancyCount, &run.WindowStart, &run.WindowEnd, &run.CreatedAt)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %s", ErrRunNotFound, id)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("select reconciliation run: %w", err)
+	}
+	return &run, nil
+}
+
+// ListDiscrepancies returns a page of a run's findings, ordered stably by id.
+// Pagination is keyset-based: `after` is the last id from the previous page.
+//
+// The returned bool reports whether more pages follow. It is derived by asking
+// for one row beyond the page and discarding it, rather than by guessing from a
+// full page -- otherwise a run whose findings divide exactly by the page size
+// hands the client a cursor that leads to an empty page.
+func (s *Store) ListDiscrepancies(ctx context.Context, runID uuid.UUID,
+	after int64, limit int) ([]reconcile.Discrepancy, int64, bool, error) {
+	// The handler rejects an out-of-range limit before reaching here; this is the
+	// backstop for any other caller.
+	if limit <= 0 || limit > maxDiscrepancyPage {
+		limit = maxDiscrepancyPage
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, kind, statement_ref, transaction_id, details
+		  FROM reconciliation_discrepancies
+		 WHERE run_id = $1 AND id > $2
+		 ORDER BY id
+		 LIMIT $3`, runID, after, limit+1)
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("select discrepancies: %w", err)
+	}
+	defer rows.Close()
+
+	var (
+		out []reconcile.Discrepancy
+		ids []int64
+	)
+	for rows.Next() {
+		var (
+			id      int64
+			d       reconcile.Discrepancy
+			details []byte
+		)
+		if err := rows.Scan(&id, &d.Kind, &d.StatementRef, &d.TransactionID, &details); err != nil {
+			return nil, 0, false, fmt.Errorf("scan discrepancy: %w", err)
+		}
+		d.ID = id
+		// UseNumber, not a plain Unmarshal: decoding into map[string]any turns
+		// every JSON number into a float64, which silently rounds the int64
+		// amounts these details carry. The POST response marshals straight from
+		// int64, so without this the same stored finding reports different
+		// amounts depending on which endpoint you ask.
+		dec := json.NewDecoder(bytes.NewReader(details))
+		dec.UseNumber()
+		if err := dec.Decode(&d.Details); err != nil {
+			return nil, 0, false, fmt.Errorf("decode discrepancy details: %w", err)
+		}
+		out = append(out, d)
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, false, fmt.Errorf("read discrepancies: %w", err)
+	}
+
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+		ids = ids[:limit]
+	}
+
+	var last int64
+	if len(ids) > 0 {
+		last = ids[len(ids)-1]
+	}
+	return out, last, hasMore, nil
+}

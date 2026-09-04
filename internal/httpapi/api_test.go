@@ -2,6 +2,7 @@ package httpapi_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +26,8 @@ type testAPI struct {
 	pool      *pgxpool.Pool
 	store     *postgres.Store
 	publisher *outbox.RecordingPublisher
+	// fundingSource is the system account the most recent fund() drew from.
+	fundingSource string
 }
 
 func newTestAPI(t *testing.T) *testAPI {
@@ -34,7 +37,7 @@ func newTestAPI(t *testing.T) *testAPI {
 	publisher := &outbox.RecordingPublisher{}
 	return &testAPI{
 		t:         t,
-		handler:   httpapi.NewServer(pool, ledger.NewService(store), store, publisher).Routes(),
+		handler:   httpapi.NewServer(pool, ledger.NewService(store), store, publisher, store).Routes(),
 		pool:      pool,
 		store:     store,
 		publisher: publisher,
@@ -93,16 +96,19 @@ func (a *testAPI) createAccount(name, currency string, allowNegative bool) strin
 
 // fund gives an account a starting balance by moving money in from a system
 // account that is allowed to go negative -- the only way money enters a ledger
-// that must sum to zero.
+// that must sum to zero. The source account id is recorded so reconciliation
+// fixtures can name it.
 func (a *testAPI) fund(accountID, currency string, amount int64) {
 	a.t.Helper()
 
 	source := a.createAccount("external-"+accountID[:8], currency, true)
+	a.fundingSource = source
 	rec := a.do(http.MethodPost, "/transactions", map[string]any{
 		"debit_account_id":  accountID,
 		"credit_account_id": source,
 		"amount":            amount,
 		"currency":          currency,
+		"external_ref":      "FUND-" + accountID[:8],
 	})
 	if rec.Code != http.StatusCreated {
 		a.t.Fatalf("fund account: status %d, body %s", rec.Code, rec.Body)
@@ -445,4 +451,53 @@ func assertLedgerSumsToZero(t *testing.T, api *testAPI) {
 	if sum != 0 {
 		t.Errorf("ledger does not sum to zero: %d", sum)
 	}
+}
+
+// postTransferWithRef makes a transfer carrying an external reference and
+// returns its transaction id.
+func (a *testAPI) postTransferWithRef(debit, credit string, amount int64, ref string) string {
+	a.t.Helper()
+
+	body := transferBody(debit, credit, amount)
+	body["external_ref"] = ref
+
+	rec := a.do(http.MethodPost, "/transactions", body)
+	if rec.Code != http.StatusCreated {
+		a.t.Fatalf("transfer %s: status %d, body %s", ref, rec.Code, rec.Body)
+	}
+	var resp struct {
+		ID string `json:"id"`
+	}
+	a.decode(rec, &resp)
+	return resp.ID
+}
+
+// transactionIDForAmount finds the transaction that moved the given amount.
+func (a *testAPI) transactionIDForAmount(amount int64) string {
+	a.t.Helper()
+
+	var id string
+	err := a.pool.QueryRow(context.Background(), `
+		SELECT DISTINCT transaction_id FROM ledger_entries WHERE amount = $1 LIMIT 1`,
+		amount).Scan(&id)
+	if err != nil {
+		a.t.Fatalf("find transaction for amount %d: %v", amount, err)
+	}
+	return id
+}
+
+// externalRefFor reads a transaction's external reference.
+func (a *testAPI) externalRefFor(transactionID string) string {
+	a.t.Helper()
+
+	var ref *string
+	err := a.pool.QueryRow(context.Background(),
+		`SELECT external_ref FROM transactions WHERE id = $1`, transactionID).Scan(&ref)
+	if err != nil {
+		a.t.Fatalf("read external_ref: %v", err)
+	}
+	if ref == nil {
+		return ""
+	}
+	return *ref
 }

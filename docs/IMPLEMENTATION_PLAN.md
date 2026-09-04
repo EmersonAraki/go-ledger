@@ -547,9 +547,54 @@ The run is persisted, so `GET /reconciliation/{id}` returns it without re-upload
 comparable over time. Reconciliation is strictly read-only against the ledger: it *reports*, it
 never auto-corrects. Corrections are reversing transactions posted through the normal API.
 
-A separate internal check in the same job asserts
-`accounts.balance == SUM(ledger_entries.signed_amount)` per account and reports a
-`balance_drift` discrepancy — this is what keeps the materialized balance honest.
+**Balance drift is a separate job, not part of a run.** Asserting
+`accounts.balance == SUM(ledger_entries.signed_amount)` is what keeps the materialized balance
+honest, but it cannot be part of a statement run. A derived balance is the sum of an account's
+entire history, so no predicate bounds it — an attempt to scope the check to the statement's own
+window was measured *slower* than the unscoped query it replaced (~120 ms against ~110 ms over
+400k entries, three runs each), because scoping chooses which accounts to check while each one's
+full history is summed regardless. On an unauthenticated endpoint that made a one-row CSV naming any active day worth a
+full ledger scan.
+
+So it runs as `cmd/driftsweep`: a scheduled job that walks every account in keyset-paginated pages,
+comparing each cached balance against its entries within a single statement — hence a single
+snapshot, so a transfer committing mid-sweep is never misreported as drift. The per-account sum is
+a correlated subquery, so one account's size is not charged to every page; the sweep still costs a
+whole-ledger scan overall, because summing a history is proportional to that history. A full sweep
+of the 400k-entry fixture takes ~46 ms at the default page size of 500, and pages smaller than that
+are slightly slower, not faster. It records a
+`reconciliation_runs` row under the source name `balance-drift-sweep` only when it finds something,
+so the report is readable through the same `GET /reconciliation/{id}`, and the absence of a run is
+itself the signal that the ledger is sound. Exit status 2 means drift, so cron alerts without
+parsing output.
+
+**The rule this settles, and what it costs to actually follow.** *Every query on the upload path
+needs a bound expressible in terms of the upload, and that bound must bound the WORK, not merely
+the rows returned.* Both halves were learned the hard way.
+
+`MaxWindowDays` caps the span. `LedgerRowsFor(statementRows)` caps the rows — derived from the
+statement rows actually read (`100` per row over a floor of `1,000`, ceiling `MaxLedgerWindowRows`),
+because a constant sized off the ledger is not a bound, it is a bigger ledger's problem deferred.
+Both window queries share the one cap.
+
+The second half bit twice. A `LIMIT` above `GROUP BY t.id HAVING COUNT(e.id) <> 2` bounds rows
+returned and not work done: on a healthy ledger the `HAVING` rejects every group, so the aggregate
+runs to completion over the whole window before the `LIMIT` can see anything — measured at **440 ms
+returning zero rows**, worse than the drift query removed above for being too expensive. The scan
+now restricts the transaction set *before* computing leg counts, and counts legs with a correlated
+subquery rather than an aggregate over a join, so the plan is an index scan over the capped set plus
+one index-only probe per transaction.
+
+Measured together on 200k transactions / 400k entries, the two-row CSV that opens the widest window
+`MaxWindowDays` allows went from **~2.1–2.4 s** of database work to **~1 ms**, with a row cap of
+1,200 in place of 200,000.
+
+A check that cannot be bounded this way does not belong on the path at all.
+
+Because these are database bounds, they are invisible in a run's output — the caller slices to the
+same cap whether or not the `LIMIT` is there, which is exactly how both went untested through four
+review rounds. The loaders therefore report how many rows the database returned, and a white-box
+test asserts it.
 
 ---
 
@@ -563,10 +608,10 @@ Each phase ends on a green `make check` (lint + `go test -race ./...`) and its o
 | 1 | Schema | **Done.** Migration `0001_init`, `cmd/migrate` (up/down/version), `pgtest` schema-per-test helper | `migrate up` is idempotent and `down`/`up` round-trips; 8 tests cover the deferred trigger, balance floor, and partial unique index |
 | 2 | Accounts + transactions | **Done.** `POST/GET /accounts`, `POST/GET /transactions` (no idempotency yet), problem+json errors, `internal/ledger` domain layer | Integration tests cover happy path, unknown account, currency mismatch, non-positive and self transfer, insufficient funds, duplicate `external_ref`, malformed body/UUID; every test asserts the ledger still sums to zero |
 | 3 | Idempotency | **Done.** `internal/idempotency` (key validation, canonical fingerprint), single-transaction claim in the store, full response matrix (§6.3) | Every row of the §6.3 matrix has a test, plus the §7.2 concurrency proof: 30 racing identical requests, exactly one execution |
-| 4 | Double-entry hardening | Reversal endpoint, account statement endpoint, balance-drift check. **Ordered `FOR UPDATE` locking, the balance floor and the materialized balance moved into phase 2** — shipping a money-transfer endpoint with a known write-skew race, when the fix is a few lines already designed in §7.1, was not defensible | `SUM(signed_amount) = 0` holds after every test in the suite |
+| 4 | Double-entry hardening | Reversal endpoint, account statement endpoint. Balance drift **shipped in phase 7** as `cmd/driftsweep`. **Ordered `FOR UPDATE` locking, the balance floor and the materialized balance moved into phase 2** — shipping a money-transfer endpoint with a known write-skew race, when the fix is a few lines already designed in §7.1, was not defensible | `SUM(signed_amount) = 0` holds after every test in the suite |
 | 5 | Concurrency proof | The two tests in §7.2 + a `SERIALIZABLE` vs `READ COMMITTED + FOR UPDATE` benchmark | Both tests pass under `-race`; ADR 0001 written with the numbers |
 | 6 | Outbox + replay | **Done.** Versioned envelope, event written in the transfer's transaction, relay with `SKIP LOCKED` + exponential backoff, `GET /events/{id}`, `POST /events/{id}/replay`, in-process relay plus standalone `cmd/relay` | Golden-file envelope test; four concurrent relays proved not to double publish; a rejected transfer proved to leave no event; replay produces a second delivery row under one `event_id` |
-| 7 | Reconciliation | CSV parser, matcher, persisted runs, both endpoints | A fixture statement with one of each discrepancy kind is classified correctly |
+| 7 | Reconciliation | **Done.** Streaming CSV parser, two-pass matcher, persisted runs, `POST /reconciliation` and `GET /reconciliation/{id}` with keyset pagination, and `cmd/driftsweep` for the balance-drift check that could not be bounded on the request path (§9) | A fixture statement with one of each discrepancy kind is classified correctly; a separate test proves reconciliation never writes to the ledger; every processing limit has a test at its boundary, including a white-box test for the two SQL `LIMIT`s whose effect a run's output cannot show; each was verified by reverting the bound and watching the test go red |
 | 8 | Optional extras | Redis response cache (only if phase 5 justifies it), Kafka/Redpanda publisher, OpenAPI spec, Prometheus metrics | Publisher swap requires no changes outside `outbox.Publisher` wiring |
 
 Phases 0–7 are the project. Phase 8 is opportunistic.
