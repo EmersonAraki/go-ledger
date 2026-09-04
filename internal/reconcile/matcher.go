@@ -35,13 +35,18 @@ const DefaultDateTolerance = 24 * time.Hour
 
 // Options tunes matching.
 type Options struct {
-	// MaxFindings and MaxLedgerRows override the package defaults when non-zero.
-	// They exist as options rather than bare constants so a test can drive the
-	// boundaries: a limit only reachable by uploading a hundred thousand rows is
-	// a limit nothing ever exercises, and untested limits are how the earlier
-	// rounds of defects in this file survived.
-	MaxFindings   int
-	MaxLedgerRows int
+	// MaxFindings, MaxLedgerRows and MaxUnreconcilable lower the package limits
+	// when non-zero. They exist as options rather than bare constants so a test
+	// can drive the boundaries: a limit only reachable by uploading a hundred
+	// thousand rows is a limit nothing ever exercises, and untested limits are
+	// how the earlier rounds of defects in this file survived.
+	//
+	// They can only lower them. These are the bounds that stop a small upload
+	// from doing unbounded work, so a caller that could raise them would be a
+	// caller that could remove them.
+	MaxFindings       int
+	MaxLedgerRows     int
+	MaxUnreconcilable int
 
 	// DateTolerance overrides DefaultDateTolerance when non-zero. It governs
 	// both how far a referenced pair's dates may differ and how far apart a
@@ -54,7 +59,7 @@ type Options struct {
 // FindingsLimit is the effective cap on reported statement findings.
 func (o Options) FindingsLimit() int {
 	if o.MaxFindings > 0 {
-		return o.MaxFindings
+		return min(o.MaxFindings, MaxFindings)
 	}
 	return MaxFindings
 }
@@ -62,9 +67,18 @@ func (o Options) FindingsLimit() int {
 // LedgerRowsLimit is the effective cap on ledger rows loaded for one comparison.
 func (o Options) LedgerRowsLimit() int {
 	if o.MaxLedgerRows > 0 {
-		return o.MaxLedgerRows
+		return min(o.MaxLedgerRows, MaxLedgerWindowRows)
 	}
 	return MaxLedgerWindowRows
+}
+
+// UnreconcilableLimit is the effective cap on unreconcilable transactions loaded
+// for one run.
+func (o Options) UnreconcilableLimit() int {
+	if o.MaxUnreconcilable > 0 {
+		return min(o.MaxUnreconcilable, MaxUnreconcilableRows)
+	}
+	return MaxUnreconcilableRows
 }
 
 func (o Options) dateTolerance() time.Duration {

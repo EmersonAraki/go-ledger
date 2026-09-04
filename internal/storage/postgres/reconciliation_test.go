@@ -122,8 +122,8 @@ func TestReconcileReportsLedgerTruncation(t *testing.T) {
 	}
 }
 
-// The findings cap must never discard the integrity checks: drift is what keeps
-// the materialized balance honest, and dropping it because a statement happened
+// The findings cap must never discard the integrity checks: an unreconcilable
+// transaction is a ledger problem, and dropping it because a statement happened
 // to be messy would silence the check exactly when the data is least trusted.
 func TestFindingsCapNeverDropsIntegrityFindings(t *testing.T) {
 	t.Parallel()
@@ -132,10 +132,11 @@ func TestFindingsCapNeverDropsIntegrityFindings(t *testing.T) {
 
 	f.transfer(ctx, t, f.bob, f.alice, 500)
 
-	// Corrupt a cached balance so a drift finding must be produced.
+	// A legless transaction inside the window: an integrity finding the
+	// statement comparison did not produce and must not be able to crowd out.
 	if _, err := f.pool.Exec(ctx,
-		`UPDATE accounts SET balance = balance + 7 WHERE id = $1`, f.bob); err != nil {
-		t.Fatalf("corrupt balance: %v", err)
+		`INSERT INTO transactions (id, currency) VALUES ($1, 'BRL')`, uuid.New()); err != nil {
+		t.Fatalf("insert legless transaction: %v", err)
 	}
 
 	// Far more statement findings than the cap allows.
@@ -151,9 +152,10 @@ func TestFindingsCapNeverDropsIntegrityFindings(t *testing.T) {
 	}
 
 	kinds := kindsOf(run)
-	if kinds[reconcile.KindBalanceDrift] != 1 {
-		t.Errorf("balance_drift = %d, want 1 -- the integrity check was dropped by the "+
-			"findings cap (kinds: %v)", kinds[reconcile.KindBalanceDrift], kinds)
+	if kinds[reconcile.KindUnreconcilableTransaction] != 1 {
+		t.Errorf("unreconcilable_transaction = %d, want 1 -- the integrity check was "+
+			"dropped by the findings cap (kinds: %v)",
+			kinds[reconcile.KindUnreconcilableTransaction], kinds)
 	}
 	if kinds[reconcile.KindFindingsTruncated] != 1 {
 		t.Errorf("findings_truncated = %d, want 1 (kinds: %v)",
@@ -234,15 +236,91 @@ func TestZeroLegTransactionIsReported(t *testing.T) {
 	var found bool
 	for _, d := range run.Discrepancies {
 		if d.Kind == reconcile.KindUnreconcilableTransaction {
-			if legs, ok := d.Details["legs"].(int); ok && legs == 0 {
-				found = true
+			legs, ok := d.Details["legs"].(int)
+			if !ok {
+				t.Fatalf("legs is %T, want int", d.Details["legs"])
 			}
-			if legs, ok := d.Details["legs"].(int64); ok && legs == 0 {
+			if legs == 0 {
 				found = true
 			}
 		}
 	}
 	if !found {
 		t.Errorf("a transaction with zero legs was not reported (kinds: %v)", kindsOf(run))
+	}
+}
+
+// The unreconcilable scan is bounded too. Unlike the comparison it runs beside,
+// its result size is set by the ledger, not the upload: a window holding a
+// million malformed transactions would return a million rows from a one-line
+// CSV. The cap is the only thing standing between that and the response.
+func TestUnreconcilableScanIsBounded(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newRecFixture(ctx, t)
+
+	// Four legless transactions -- unreconcilable, and none of them produced by
+	// anything in the statement.
+	for range 4 {
+		if _, err := f.pool.Exec(ctx,
+			`INSERT INTO transactions (id, currency) VALUES ($1, 'BRL')`, uuid.New()); err != nil {
+			t.Fatalf("insert legless transaction: %v", err)
+		}
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	stmt := parse(t, recCSVHeader+
+		fmt.Sprintf("TRX-NONE,%s,%s,%s,1,BRL\n", now, f.bob, f.alice))
+
+	run, err := f.store.Reconcile(ctx, "s.csv", stmt, reconcile.Options{MaxUnreconcilable: 2})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	kinds := kindsOf(run)
+	if kinds[reconcile.KindUnreconcilableTransaction] != 2 {
+		t.Errorf("unreconcilable_transaction = %d, want exactly the cap of 2 (kinds: %v)",
+			kinds[reconcile.KindUnreconcilableTransaction], kinds)
+	}
+	if kinds[reconcile.KindLedgerTruncated] != 1 {
+		t.Errorf("ledger_truncated = %d, want 1 -- the run reported a partial scan "+
+			"as if it were complete (kinds: %v)", kinds[reconcile.KindLedgerTruncated], kinds)
+	}
+
+	// At the cap with nothing dropped, truncation must not be claimed.
+	run, err = f.store.Reconcile(ctx, "s.csv", stmt, reconcile.Options{MaxUnreconcilable: 4})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	kinds = kindsOf(run)
+	if kinds[reconcile.KindUnreconcilableTransaction] != 4 {
+		t.Errorf("unreconcilable_transaction = %d, want 4 (kinds: %v)",
+			kinds[reconcile.KindUnreconcilableTransaction], kinds)
+	}
+	if kinds[reconcile.KindLedgerTruncated] != 0 {
+		t.Errorf("ledger_truncated = %d, want 0 at exactly the cap with nothing dropped",
+			kinds[reconcile.KindLedgerTruncated])
+	}
+}
+
+// The caller-supplied limits may only lower the package caps, never raise them.
+// They exist so tests can reach the boundaries; a caller that could raise them
+// would be a caller that could remove the bounds these limits are.
+func TestOptionsCannotRaiseTheLimits(t *testing.T) {
+	t.Parallel()
+
+	opts := reconcile.Options{
+		MaxFindings:       reconcile.MaxFindings * 10,
+		MaxLedgerRows:     reconcile.MaxLedgerWindowRows * 10,
+		MaxUnreconcilable: reconcile.MaxUnreconcilableRows * 10,
+	}
+	if got := opts.FindingsLimit(); got != reconcile.MaxFindings {
+		t.Errorf("FindingsLimit = %d, want it clamped to %d", got, reconcile.MaxFindings)
+	}
+	if got := opts.LedgerRowsLimit(); got != reconcile.MaxLedgerWindowRows {
+		t.Errorf("LedgerRowsLimit = %d, want it clamped to %d", got, reconcile.MaxLedgerWindowRows)
+	}
+	if got := opts.UnreconcilableLimit(); got != reconcile.MaxUnreconcilableRows {
+		t.Errorf("UnreconcilableLimit = %d, want it clamped to %d",
+			got, reconcile.MaxUnreconcilableRows)
 	}
 }

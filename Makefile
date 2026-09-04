@@ -44,6 +44,8 @@ run: ## Run the API server
 build: ## Build binaries into ./bin
 	go build -o bin/api ./cmd/api
 	go build -o bin/migrate ./cmd/migrate
+	go build -o bin/relay ./cmd/relay
+	go build -o bin/driftsweep ./cmd/driftsweep
 
 .PHONY: test
 test: ## Run all tests with the race detector
@@ -52,6 +54,10 @@ test: ## Run all tests with the race detector
 .PHONY: test-short
 test-short: ## Run tests that need no database
 	go test -race -count=1 ./...
+
+.PHONY: driftsweep
+driftsweep: ## Check every account's cached balance against its entries
+	DATABASE_URL="$(DB_URL)" go run ./cmd/driftsweep
 
 .PHONY: fmt
 fmt: ## Format all Go code

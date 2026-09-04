@@ -77,9 +77,10 @@ const (
 	KindUnreconcilableTransaction = "unreconcilable_transaction"
 
 	// KindBalanceDrift means an account's cached balance disagrees with the sum
-	// of its entries. Not a statement finding at all -- an internal integrity
-	// check that rides along, because this job already holds a consistent
-	// snapshot of the whole ledger.
+	// of its entries. Not a statement finding at all, and not produced by a
+	// statement run: a derived balance is the sum of an account's whole history,
+	// so the check is a full sweep and belongs in cmd/driftsweep. It reaches a
+	// report through the same tables, under the DriftSweepSource name.
 	KindBalanceDrift = "balance_drift"
 )
 
@@ -91,10 +92,10 @@ const (
 // lines expands into hundreds of megabytes of retained heap, and there is no
 // per-client limit on this endpoint. These caps bound the parsing and the
 // reporting. They do NOT by themselves bound the database side: that is bounded
-// separately, by MaxWindowDays and MaxLedgerWindowRows and by scoping the drift
-// check to the statement's window. Every query this job runs needs its own
-// bound; capping the upload does nothing for a query whose cost scales with the
-// ledger.
+// separately, by MaxWindowDays, MaxLedgerWindowRows and MaxUnreconcilableRows.
+// Every query this job runs needs its own bound; capping the upload does nothing
+// for a query whose cost scales with the ledger. A check that cannot be bounded
+// that way does not belong on this path at all -- see cmd/driftsweep.
 const (
 	// MaxStatementRows is the most data rows read from one statement.
 	MaxStatementRows = 100_000
@@ -118,6 +119,14 @@ const (
 	// MaxLedgerWindowRows bounds how much ledger is pulled into memory for one
 	// comparison, whatever the window turns out to contain.
 	MaxLedgerWindowRows = 200_000
+
+	// MaxUnreconcilableRows bounds the integrity scan over the same window.
+	// Unlike the comparison it feeds, this one is not proportional to the
+	// upload: a window holding a million malformed transactions would return a
+	// million rows from a one-line CSV. It is deliberately far smaller than
+	// MaxLedgerWindowRows, because a healthy ledger produces none of these and a
+	// ledger producing ten thousand has one problem, not ten thousand.
+	MaxUnreconcilableRows = 10_000
 
 	// MaxReportedParseErrors is the most individual unparseable-row findings
 	// collected. Beyond it the remainder are counted, not listed: a file that is

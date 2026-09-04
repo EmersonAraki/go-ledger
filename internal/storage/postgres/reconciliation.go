@@ -25,7 +25,7 @@ var ErrRunNotFound = errors.New("reconciliation run not found")
 // The comparison runs in a REPEATABLE READ, read-only transaction. This is the
 // one place in the system where snapshot isolation is exactly the right tool:
 // the job issues several queries -- the transactions in the window, then the
-// balance-drift check across every account -- and they must all observe the same
+// ones no statement row could ever claim -- and they must all observe the same
 // instant. Under READ COMMITTED a transfer committing between those queries
 // would appear in one and not the other, and the job would invent a discrepancy
 // that never existed.
@@ -69,12 +69,8 @@ func (s *Store) Reconcile(
 
 	matched, discrepancies := reconcile.Match(rows, ledger, opts)
 
-	unreconcilable, err := loadUnreconcilable(ctx, tx, start, end)
-	if err != nil {
-		return nil, err
-	}
-
-	drifts, err := loadBalanceDrift(ctx, tx, start, end)
+	unreconcilable, unreconcilableTruncated, err := loadUnreconcilable(
+		ctx, tx, start, end, opts.UnreconcilableLimit())
 	if err != nil {
 		return nil, err
 	}
@@ -86,10 +82,10 @@ func (s *Store) Reconcile(
 	}
 
 	// Bound the statement comparison, which is the only part that scales with
-	// the upload. The integrity findings are deliberately exempt and appended
-	// after: drift is what keeps the materialized balance honest, and dropping
-	// it because a statement happened to be messy would silence the check
-	// precisely when the data is least trustworthy.
+	// the upload. The unreconcilable-transaction findings are deliberately
+	// exempt and appended after: they are ledger integrity problems, and
+	// dropping them because a statement happened to be messy would silence the
+	// check precisely when the data is least trustworthy.
 	findingsLimit := opts.FindingsLimit()
 	capped := discrepancies
 	var droppedFindings int
@@ -99,11 +95,10 @@ func (s *Store) Reconcile(
 	}
 
 	all := make([]reconcile.Discrepancy, 0,
-		len(parseErrors)+len(capped)+len(unreconcilable)+len(drifts)+2)
+		len(parseErrors)+len(capped)+len(unreconcilable)+3)
 	all = append(all, parseErrors...)
 	all = append(all, capped...)
 	all = append(all, unreconcilable...)
-	all = append(all, reconcile.DriftDiscrepancies(drifts)...)
 
 	if droppedFindings > 0 {
 		all = append(all, reconcile.Discrepancy{
@@ -122,6 +117,15 @@ func (s *Store) Reconcile(
 			Details: map[string]any{
 				"reason":     "the statement window holds more transactions than one comparison loads",
 				"max_loaded": opts.LedgerRowsLimit(),
+			},
+		})
+	}
+	if unreconcilableTruncated {
+		all = append(all, reconcile.Discrepancy{
+			Kind: reconcile.KindLedgerTruncated,
+			Details: map[string]any{
+				"reason":     "the statement window holds more unreconcilable transactions than one run lists",
+				"max_loaded": opts.UnreconcilableLimit(),
 			},
 		})
 	}
@@ -205,11 +209,17 @@ func loadLedgerWindow(ctx context.Context, tx pgx.Tx, start, end *time.Time,
 // loadUnreconcilable finds transactions in the window that the statement format
 // cannot describe, so they can be reported instead of silently skipped by the
 // two-leg restriction in loadLedgerWindow.
-func loadUnreconcilable(ctx context.Context, tx pgx.Tx, start, end *time.Time) ([]reconcile.Discrepancy, error) {
+func loadUnreconcilable(ctx context.Context, tx pgx.Tx, start, end *time.Time,
+	maxRows int) ([]reconcile.Discrepancy, bool, error) {
 	if start == nil || end == nil {
-		return nil, nil
+		return nil, false, nil
+	}
+	if maxRows <= 0 {
+		maxRows = reconcile.MaxUnreconcilableRows
 	}
 
+	// LIMIT one past the cap, so a full page is distinguishable from a page that
+	// merely happened to land on it.
 	rows, err := tx.Query(ctx, `
 		SELECT t.id, t.currency, t.created_at, COUNT(e.id) AS legs
 		  FROM transactions t
@@ -220,13 +230,17 @@ func loadUnreconcilable(ctx context.Context, tx pgx.Tx, start, end *time.Time) (
 		 WHERE t.created_at BETWEEN $1 AND $2
 		 GROUP BY t.id, t.currency, t.created_at
 		HAVING COUNT(e.id) <> 2
-		 ORDER BY t.created_at, t.id`, start.UTC(), end.UTC())
+		 ORDER BY t.created_at, t.id
+		 LIMIT $3`, start.UTC(), end.UTC(), maxRows+1)
 	if err != nil {
-		return nil, fmt.Errorf("load unreconcilable transactions: %w", err)
+		return nil, false, fmt.Errorf("load unreconcilable transactions: %w", err)
 	}
 	defer rows.Close()
 
-	var out []reconcile.Discrepancy
+	var (
+		out       []reconcile.Discrepancy
+		truncated bool
+	)
 	for rows.Next() {
 		var (
 			id       uuid.UUID
@@ -235,7 +249,11 @@ func loadUnreconcilable(ctx context.Context, tx pgx.Tx, start, end *time.Time) (
 			legs     int
 		)
 		if err := rows.Scan(&id, &currency, &postedAt, &legs); err != nil {
-			return nil, fmt.Errorf("scan unreconcilable transaction: %w", err)
+			return nil, false, fmt.Errorf("scan unreconcilable transaction: %w", err)
+		}
+		if len(out) == maxRows {
+			truncated = true
+			break
 		}
 		txID := id
 		out = append(out, reconcile.Discrepancy{
@@ -250,62 +268,9 @@ func loadUnreconcilable(ctx context.Context, tx pgx.Tx, start, end *time.Time) (
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read unreconcilable transactions: %w", err)
+		return nil, false, fmt.Errorf("read unreconcilable transactions: %w", err)
 	}
-	return out, nil
-}
-
-// loadBalanceDrift finds accounts whose cached balance disagrees with the sum of
-// their entries. This is what keeps the materialized balance honest: the cache
-// is a performance choice, and SUM(signed_amount) remains the source of truth.
-//
-// It is scoped to the accounts this run actually examined. An unscoped version
-// aggregated every entry that had ever been written, on every upload, with no
-// window predicate and no limit -- so a header-only CSV, which skips both of the
-// other queries entirely, still swept the whole ledger from an 80-byte
-// unauthenticated request. Scoping keeps the check where §9 wants it, riding
-// along on the snapshot this job already holds, without letting the cost of a
-// request scale with the size of the database rather than the size of the
-// upload.
-//
-// The trade-off is deliberate and worth stating: drift on an account no
-// statement has touched is not detected here. That is a whole-ledger sweep, and
-// it belongs in a scheduled job rather than on a request path.
-func loadBalanceDrift(ctx context.Context, tx pgx.Tx, start, end *time.Time) ([]reconcile.BalanceDrift, error) {
-	if start == nil || end == nil {
-		return nil, nil
-	}
-
-	rows, err := tx.Query(ctx, `
-		SELECT a.id, a.name, a.balance, COALESCE(SUM(e.signed_amount), 0) AS derived
-		  FROM accounts a
-		  LEFT JOIN ledger_entries e ON e.account_id = a.id
-		 WHERE a.id IN (
-		           SELECT we.account_id
-		             FROM ledger_entries we
-		             JOIN transactions wt ON wt.id = we.transaction_id
-		            WHERE wt.created_at BETWEEN $1 AND $2
-		       )
-		 GROUP BY a.id, a.name, a.balance
-		HAVING a.balance <> COALESCE(SUM(e.signed_amount), 0)
-		 ORDER BY a.name`, start.UTC(), end.UTC())
-	if err != nil {
-		return nil, fmt.Errorf("check balance drift: %w", err)
-	}
-	defer rows.Close()
-
-	var out []reconcile.BalanceDrift
-	for rows.Next() {
-		var d reconcile.BalanceDrift
-		if err := rows.Scan(&d.AccountID, &d.Name, &d.Cached, &d.Derived); err != nil {
-			return nil, fmt.Errorf("scan balance drift: %w", err)
-		}
-		out = append(out, d)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read balance drift: %w", err)
-	}
-	return out, nil
+	return out, truncated, nil
 }
 
 // saveRun persists the run and its discrepancies in one transaction, so a report

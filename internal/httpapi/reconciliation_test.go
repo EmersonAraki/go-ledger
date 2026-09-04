@@ -265,9 +265,11 @@ func TestReconcileNeverModifiesTheLedger(t *testing.T) {
 	assertLedgerSumsToZero(t, api)
 }
 
-// The drift check is what keeps the cached balance honest. It is scoped to the
-// accounts the run examined, so the statement must actually cover them.
-func TestReconcileDetectsBalanceDrift(t *testing.T) {
+// An upload must never sweep the ledger for balance drift, however squarely the
+// statement covers the drifting account. Computing a derived balance costs an
+// account's entire history, so it belongs in cmd/driftsweep; on this
+// unauthenticated endpoint a one-row CSV would have bought a full scan.
+func TestUploadNeverSweepsForBalanceDrift(t *testing.T) {
 	t.Parallel()
 	api := newTestAPI(t)
 
@@ -283,6 +285,8 @@ func TestReconcileDetectsBalanceDrift(t *testing.T) {
 		t.Fatalf("corrupt balance: %v", err)
 	}
 
+	// One row, naming the corrupted account, dated inside the window: every
+	// condition the old scoped query needed to reach the whole ledger.
 	csv := csvHeader + fmt.Sprintf("TRX-1,%s,%s,%s,300,BRL\n",
 		api.postedAt(txID).Format(time.RFC3339), bob, alice)
 
@@ -293,34 +297,17 @@ func TestReconcileDetectsBalanceDrift(t *testing.T) {
 
 	var run runBody
 	api.decode(rec, &run)
-
-	var drift *struct {
-		Kind          string         `json:"kind"`
-		StatementRef  *string        `json:"statement_ref"`
-		TransactionID *string        `json:"transaction_id"`
-		Details       map[string]any `json:"details"`
-	}
-	for i := range run.Discrepancies {
-		if run.Discrepancies[i].Kind == reconcile.KindBalanceDrift {
-			drift = &run.Discrepancies[i]
-			break
-		}
-	}
-	if drift == nil {
-		t.Fatalf("balance drift was not detected; kinds: %v", run.kinds())
-	}
-	if name, _ := drift.Details["account_name"].(string); name != "bob" {
-		t.Errorf("drift reported for %q, want bob", name)
-	}
-	if diff, _ := drift.Details["difference"].(float64); diff != 42 {
-		t.Errorf("difference = %v, want 42", diff)
+	if got := run.kinds()[reconcile.KindBalanceDrift]; got != 0 {
+		t.Errorf("balance_drift = %d, want 0 -- a one-row upload swept the ledger "+
+			"(kinds: %v)", got, run.kinds())
 	}
 }
 
-// A statement with no rows must not make the server sweep the ledger. This was a
-// real hole: the drift check had no window predicate and no limit, so a
-// header-only 80-byte upload aggregated every entry ever written, on an endpoint
-// with no authentication. A run with nothing to reconcile must do no work.
+// A statement with no rows must do no ledger work at all. This was a real hole:
+// the drift check had no window predicate and no limit, so a header-only
+// 80-byte upload aggregated every entry ever written, on an endpoint with no
+// authentication. Every query on this path is now gated on a window the file
+// itself must supply; with no rows there is no window, and nothing runs.
 func TestHeaderOnlyStatementDoesNoLedgerWork(t *testing.T) {
 	t.Parallel()
 	api := newTestAPI(t)
@@ -346,10 +333,6 @@ func TestHeaderOnlyStatementDoesNoLedgerWork(t *testing.T) {
 
 	if run.StatementRows != 0 {
 		t.Errorf("statement_rows = %d, want 0", run.StatementRows)
-	}
-	if got := run.kinds()[reconcile.KindBalanceDrift]; got != 0 {
-		t.Errorf("balance_drift = %d, want 0 -- an empty statement swept the ledger "+
-			"(kinds: %v)", got, run.kinds())
 	}
 	if !run.Clean {
 		t.Errorf("an empty statement produced findings: %v", run.kinds())

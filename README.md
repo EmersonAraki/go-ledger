@@ -72,6 +72,8 @@ still runs with no services up.
 | --- | --- |
 | `cmd/api` | HTTP server: wiring, graceful shutdown |
 | `cmd/migrate` | Schema migration CLI (`up`, `down [n]`, `version`) |
+| `cmd/relay` | Standalone outbox publisher, for scaling delivery out |
+| `cmd/driftsweep` | Scheduled full-ledger balance-drift check (exit 2 on drift) |
 | `internal/httpapi` | Routing, handlers, problem+json errors |
 | `internal/storage/postgres` | Migrations and all SQL |
 | `internal/platform/pgtest` | Isolated-schema test harness |
