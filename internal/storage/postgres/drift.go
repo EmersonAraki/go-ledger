@@ -14,14 +14,20 @@ import (
 //
 // The sum is a correlated subquery per account, deliberately, and not a join
 // against the page. Measured over 400k entries, the join plan seq-scanned every
-// entry in the table for a page of ten accounts -- 49ms a page, so paging made
-// the sweep worse the smaller the pages got. Per account, the planner uses
-// ledger_entries_account_id_created_at_idx instead: the same page costs 0.8ms,
-// and the sweep's cost finally scales with the page rather than the ledger.
+// entry in the table for a page of ten accounts, so every page cost a full scan
+// and paging made the sweep worse the smaller the pages got. Per account the
+// planner uses ledger_entries_account_id_created_at_idx instead, and a page
+// costs only the entries its own accounts own.
+//
+// That is a page-local cost, not a cheap one: a page holding a funding account
+// with 200k entries costs far more than a page of ten quiet ones (43ms against
+// 1.3ms, measured). Summing an account's history is inherently proportional to
+// that history -- see SweepDrift -- and this only keeps one account's size from
+// being charged to every page.
 //
 // Balance and sum come from one statement, hence one snapshot, so a transfer
 // committing mid-sweep cannot be misreported as drift.
-func (s *Store) ScanDriftPage(ctx context.Context, after uuid.UUID, limit int) (reconcile.DriftPage, error) {
+func (s *Store) ScanDriftPage(ctx context.Context, after *uuid.UUID, limit int) (reconcile.DriftPage, error) {
 	if limit <= 0 {
 		limit = reconcile.DefaultDriftPageSize
 	}
@@ -35,7 +41,9 @@ func (s *Store) ScanDriftPage(ctx context.Context, after uuid.UUID, limit int) (
 		                  WHERE e.account_id = p.id), 0) AS derived
 		  FROM (SELECT id, name, balance
 		          FROM accounts
-		         WHERE id > $1
+		         -- NULL starts the sweep, so an all-zeroes account id is not
+		         -- silently skipped by a "> zero uuid" cursor.
+		         WHERE $1::uuid IS NULL OR id > $1
 		         ORDER BY id
 		         LIMIT $2) p
 		 ORDER BY p.id`, after, limit)

@@ -69,6 +69,31 @@ func (f *recFixture) transfer(ctx context.Context, t *testing.T, debit, credit u
 	}
 }
 
+// transferWithRef posts a transfer carrying an external reference, so a
+// statement row can match it exactly.
+func (f *recFixture) transferWithRef(ctx context.Context, t *testing.T,
+	debit, credit uuid.UUID, amount int64, ref string) {
+	t.Helper()
+
+	claim := ledger.Claim{
+		Key:         uuid.NewString(),
+		Endpoint:    "POST /transactions",
+		Fingerprint: []byte(uuid.NewString()),
+	}
+	render := func(tx *ledger.Transaction) (int, []byte, error) {
+		return 201, []byte(`{"id":"` + tx.ID.String() + `"}`), nil
+	}
+	if _, err := f.store.Transfer(ctx, ledger.TransferCommand{
+		DebitAccountID:  debit,
+		CreditAccountID: credit,
+		Amount:          amount,
+		Currency:        "BRL",
+		ExternalRef:     &ref,
+	}, claim, render); err != nil {
+		t.Fatalf("transfer with ref %s: %v", ref, err)
+	}
+}
+
 // parse turns a CSV into a Statement the store can reconcile.
 func parse(t *testing.T, csv string) reconcile.Statement {
 	t.Helper()
@@ -250,77 +275,149 @@ func TestZeroLegTransactionIsReported(t *testing.T) {
 	}
 }
 
-// The unreconcilable scan is bounded too. Unlike the comparison it runs beside,
-// its result size is set by the ledger, not the upload: a window holding a
-// million malformed transactions would return a million rows from a one-line
-// CSV. The cap is the only thing standing between that and the response.
-func TestUnreconcilableScanIsBounded(t *testing.T) {
+// The unreconcilable scan's bound has to be a DATABASE bound, not a Go-side
+// slice. The earlier version capped the returned slice while the SQL still
+// aggregated the whole window -- deleting its LIMIT changed nothing observable,
+// so nothing tested the half that protects the database.
+//
+// This pins the real behaviour: the scan examines the FIRST maxRows
+// transactions of the window, so a malformed one past that point is not found
+// and the run says so. Delete the LIMIT and it is found, and this fails.
+func TestUnreconcilableScanIsBoundedInTheDatabase(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	f := newRecFixture(ctx, t)
 
-	// Four legless transactions -- unreconcilable, and none of them produced by
-	// anything in the statement.
-	for range 4 {
+	// A fixed day, so ordering inside the window is deterministic and the
+	// fixture's own funding transfer (posted at now()) falls outside it.
+	day := time.Date(2025, 6, 15, 0, 0, 0, 0, time.UTC)
+	const legless = 4
+	for i := range legless {
 		if _, err := f.pool.Exec(ctx,
-			`INSERT INTO transactions (id, currency) VALUES ($1, 'BRL')`, uuid.New()); err != nil {
-			t.Fatalf("insert legless transaction: %v", err)
+			`INSERT INTO transactions (id, currency, created_at) VALUES ($1, 'BRL', $2)`,
+			uuid.New(), day.Add(time.Duration(i+1)*time.Hour)); err != nil {
+			t.Fatalf("insert legless transaction %d: %v", i, err)
 		}
+	}
+
+	stmt := parse(t, recCSVHeader+fmt.Sprintf("TRX-NONE,%s,%s,%s,1,BRL\n",
+		day.Add(2*time.Hour).Format(time.RFC3339), f.bob, f.alice))
+
+	// Cap of 2: the scan examines the first two transactions of the window and
+	// stops, so only two of the four are found. Without the SQL LIMIT all four
+	// would come back, which is exactly what this pins down.
+	run, err := f.store.Reconcile(ctx, "s.csv", stmt, reconcile.Options{MaxLedgerRows: 2})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	kinds := kindsOf(run)
+	if kinds[reconcile.KindUnreconcilableTransaction] != 2 {
+		t.Errorf("unreconcilable_transaction = %d, want exactly the cap of 2 -- the "+
+			"scan read past its cap, so the database-side bound is doing nothing "+
+			"(kinds: %v)", kinds[reconcile.KindUnreconcilableTransaction], kinds)
+	}
+	if kinds[reconcile.KindUnreconcilableTruncated] != 1 {
+		t.Errorf("unreconcilable_truncated = %d, want 1 -- a partial scan was "+
+			"reported as a complete one (kinds: %v)",
+			kinds[reconcile.KindUnreconcilableTruncated], kinds)
+	}
+
+	// With a cap past them, all four are found and nothing is truncated.
+	run, err = f.store.Reconcile(ctx, "s.csv", stmt, reconcile.Options{})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	kinds = kindsOf(run)
+	if kinds[reconcile.KindUnreconcilableTransaction] != legless {
+		t.Errorf("unreconcilable_transaction = %d, want %d under a cap that reaches "+
+			"them (kinds: %v)", kinds[reconcile.KindUnreconcilableTransaction], legless, kinds)
+	}
+	if kinds[reconcile.KindUnreconcilableTruncated] != 0 {
+		t.Errorf("unreconcilable_truncated = %d, want 0 (kinds: %v)",
+			kinds[reconcile.KindUnreconcilableTruncated], kinds)
+	}
+}
+
+// The same for loadLedgerWindow: its LIMIT must bound the database, so a
+// transaction sorting past the cap is genuinely not loaded and therefore not
+// matched. Deleting the LIMIT lets it match, and this fails.
+func TestLedgerWindowLimitIsADatabaseBound(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newRecFixture(ctx, t)
+
+	// Several transfers; the referenced one is posted last so it sorts last.
+	for range 3 {
+		f.transfer(ctx, t, f.bob, f.alice, 100)
+	}
+	f.transferWithRef(ctx, t, f.bob, f.alice, 777, "TRX-LAST")
+
+	var postedAt time.Time
+	if err := f.pool.QueryRow(ctx,
+		`SELECT created_at FROM transactions WHERE external_ref = 'TRX-LAST'`).Scan(&postedAt); err != nil {
+		t.Fatalf("read posted_at: %v", err)
+	}
+	stmt := parse(t, recCSVHeader+fmt.Sprintf("TRX-LAST,%s,%s,%s,777,BRL\n",
+		postedAt.UTC().Format(time.RFC3339Nano), f.bob, f.alice))
+
+	// Cap below its position: it is never loaded, so the statement row has
+	// nothing to match against and the run reports the window as truncated.
+	run, err := f.store.Reconcile(ctx, "s.csv", stmt, reconcile.Options{MaxLedgerRows: 2})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	kinds := kindsOf(run)
+	if run.MatchedCount != 0 {
+		t.Errorf("matched = %d, want 0 -- a transaction past the cap was loaded, so "+
+			"the LIMIT is not bounding the database", run.MatchedCount)
+	}
+	if kinds[reconcile.KindLedgerTruncated] != 1 {
+		t.Errorf("ledger_truncated = %d, want 1 (kinds: %v)",
+			kinds[reconcile.KindLedgerTruncated], kinds)
+	}
+
+	// Uncapped, the same statement matches exactly.
+	run, err = f.store.Reconcile(ctx, "s.csv", stmt, reconcile.Options{})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if run.MatchedCount != 1 {
+		t.Errorf("matched = %d, want 1 without the cap (kinds: %v)",
+			run.MatchedCount, kindsOf(run))
+	}
+}
+
+// The row cap must be a function of the upload, not a constant sized off the
+// ledger. A two-row statement must not be able to buy a 200,000-row scan.
+func TestLedgerRowCapIsDerivedFromTheUpload(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newRecFixture(ctx, t)
+
+	// Far more ledger than a tiny statement should be allowed to examine, if
+	// the cap were per-row rather than a flat constant.
+	for range 12 {
+		f.transfer(ctx, t, f.bob, f.alice, 10)
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	stmt := parse(t, recCSVHeader+
 		fmt.Sprintf("TRX-NONE,%s,%s,%s,1,BRL\n", now, f.bob, f.alice))
 
-	run, err := f.store.Reconcile(ctx, "s.csv", stmt, reconcile.Options{MaxUnreconcilable: 2})
+	// One statement row earns MinLedgerWindowRows + one row's allowance, so
+	// nothing here is truncated -- the floor exists precisely so a small upload
+	// against a small ledger reports a complete run.
+	run, err := f.store.Reconcile(ctx, "s.csv", stmt, reconcile.Options{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	kinds := kindsOf(run)
-	if kinds[reconcile.KindUnreconcilableTransaction] != 2 {
-		t.Errorf("unreconcilable_transaction = %d, want exactly the cap of 2 (kinds: %v)",
-			kinds[reconcile.KindUnreconcilableTransaction], kinds)
+	if got := kindsOf(run)[reconcile.KindLedgerTruncated]; got != 0 {
+		t.Errorf("ledger_truncated = %d, want 0 -- the floor should cover a small "+
+			"ledger (kinds: %v)", got, kindsOf(run))
 	}
-	if kinds[reconcile.KindLedgerTruncated] != 1 {
-		t.Errorf("ledger_truncated = %d, want 1 -- the run reported a partial scan "+
-			"as if it were complete (kinds: %v)", kinds[reconcile.KindLedgerTruncated], kinds)
-	}
-
-	// At the cap with nothing dropped, truncation must not be claimed.
-	run, err = f.store.Reconcile(ctx, "s.csv", stmt, reconcile.Options{MaxUnreconcilable: 4})
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	kinds = kindsOf(run)
-	if kinds[reconcile.KindUnreconcilableTransaction] != 4 {
-		t.Errorf("unreconcilable_transaction = %d, want 4 (kinds: %v)",
-			kinds[reconcile.KindUnreconcilableTransaction], kinds)
-	}
-	if kinds[reconcile.KindLedgerTruncated] != 0 {
-		t.Errorf("ledger_truncated = %d, want 0 at exactly the cap with nothing dropped",
-			kinds[reconcile.KindLedgerTruncated])
-	}
-}
-
-// The caller-supplied limits may only lower the package caps, never raise them.
-// They exist so tests can reach the boundaries; a caller that could raise them
-// would be a caller that could remove the bounds these limits are.
-func TestOptionsCannotRaiseTheLimits(t *testing.T) {
-	t.Parallel()
-
-	opts := reconcile.Options{
-		MaxFindings:       reconcile.MaxFindings * 10,
-		MaxLedgerRows:     reconcile.MaxLedgerWindowRows * 10,
-		MaxUnreconcilable: reconcile.MaxUnreconcilableRows * 10,
-	}
-	if got := opts.FindingsLimit(); got != reconcile.MaxFindings {
-		t.Errorf("FindingsLimit = %d, want it clamped to %d", got, reconcile.MaxFindings)
-	}
-	if got := opts.LedgerRowsLimit(); got != reconcile.MaxLedgerWindowRows {
-		t.Errorf("LedgerRowsLimit = %d, want it clamped to %d", got, reconcile.MaxLedgerWindowRows)
-	}
-	if got := opts.UnreconcilableLimit(); got != reconcile.MaxUnreconcilableRows {
-		t.Errorf("UnreconcilableLimit = %d, want it clamped to %d",
-			got, reconcile.MaxUnreconcilableRows)
+	// And the cap itself is the derived one, not the ceiling.
+	if got := reconcile.LedgerRowsFor(stmt.RowsRead); got >= reconcile.MaxLedgerWindowRows {
+		t.Errorf("LedgerRowsFor(%d) = %d, want far below the ceiling %d",
+			stmt.RowsRead, got, reconcile.MaxLedgerWindowRows)
 	}
 }

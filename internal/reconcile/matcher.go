@@ -18,15 +18,6 @@ type LedgerTransaction struct {
 	Currency        string
 }
 
-// BalanceDrift is an account whose cached balance disagrees with the sum of its
-// entries.
-type BalanceDrift struct {
-	AccountID uuid.UUID
-	Name      string
-	Cached    int64
-	Derived   int64
-}
-
 // DefaultDateTolerance is how far a statement's posting date may differ from the
 // ledger's before it counts as a mismatch. Statements are commonly stamped on
 // the settlement date rather than the moment of posting, so a day of slack is
@@ -35,18 +26,17 @@ const DefaultDateTolerance = 24 * time.Hour
 
 // Options tunes matching.
 type Options struct {
-	// MaxFindings, MaxLedgerRows and MaxUnreconcilable lower the package limits
-	// when non-zero. They exist as options rather than bare constants so a test
-	// can drive the boundaries: a limit only reachable by uploading a hundred
-	// thousand rows is a limit nothing ever exercises, and untested limits are
-	// how the earlier rounds of defects in this file survived.
+	// MaxFindings and MaxLedgerRows lower the computed limits when non-zero.
+	// They exist as options rather than bare constants so a test can drive the
+	// boundaries: a limit only reachable by uploading a hundred thousand rows is
+	// a limit nothing ever exercises, and untested limits are how the earlier
+	// rounds of defects in this file survived.
 	//
 	// They can only lower them. These are the bounds that stop a small upload
 	// from doing unbounded work, so a caller that could raise them would be a
 	// caller that could remove them.
-	MaxFindings       int
-	MaxLedgerRows     int
-	MaxUnreconcilable int
+	MaxFindings   int
+	MaxLedgerRows int
 
 	// DateTolerance overrides DefaultDateTolerance when non-zero. It governs
 	// both how far a referenced pair's dates may differ and how far apart a
@@ -64,21 +54,15 @@ func (o Options) FindingsLimit() int {
 	return MaxFindings
 }
 
-// LedgerRowsLimit is the effective cap on ledger rows loaded for one comparison.
-func (o Options) LedgerRowsLimit() int {
+// LedgerRowsLimit is the effective cap on ledger rows examined for one run.
+// It is derived from the statement rows actually read, so the database work a
+// request causes is a function of the file it uploaded.
+func (o Options) LedgerRowsLimit(statementRows int) int {
+	limit := LedgerRowsFor(statementRows)
 	if o.MaxLedgerRows > 0 {
-		return min(o.MaxLedgerRows, MaxLedgerWindowRows)
+		return min(o.MaxLedgerRows, limit)
 	}
-	return MaxLedgerWindowRows
-}
-
-// UnreconcilableLimit is the effective cap on unreconcilable transactions loaded
-// for one run.
-func (o Options) UnreconcilableLimit() int {
-	if o.MaxUnreconcilable > 0 {
-		return min(o.MaxUnreconcilable, MaxUnreconcilableRows)
-	}
-	return MaxUnreconcilableRows
+	return limit
 }
 
 func (o Options) dateTolerance() time.Duration {
@@ -330,24 +314,6 @@ func within(t time.Time, start, end *time.Time) bool {
 		return false
 	}
 	return !t.Before(*start) && !t.After(*end)
-}
-
-// DriftDiscrepancies turns balance drift findings into discrepancies.
-func DriftDiscrepancies(drifts []BalanceDrift) []Discrepancy {
-	out := make([]Discrepancy, 0, len(drifts))
-	for _, d := range drifts {
-		out = append(out, Discrepancy{
-			Kind: KindBalanceDrift,
-			Details: map[string]any{
-				"account_id":      d.AccountID,
-				"account_name":    d.Name,
-				"cached_balance":  d.Cached,
-				"derived_balance": d.Derived,
-				"difference":      d.Cached - d.Derived,
-			},
-		})
-	}
-	return out
 }
 
 // Window returns the period a statement covers, or nils when it has no rows.

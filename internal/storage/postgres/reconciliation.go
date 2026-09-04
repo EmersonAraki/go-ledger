@@ -62,18 +62,26 @@ func (s *Store) Reconcile(
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
 	start, end := reconcile.Window(rows)
-	ledger, ledgerTruncated, err := loadLedgerWindow(ctx, tx, start, end, opts.DateTolerance, opts.LedgerRowsLimit())
+	// One cap for the whole run, derived from the rows the file actually held.
+	rowLimit := opts.LedgerRowsLimit(stmt.RowsRead)
+
+	ledger, ledgerFetched, err := loadLedgerWindow(ctx, tx, start, end, opts.DateTolerance, rowLimit)
 	if err != nil {
 		return nil, err
+	}
+	// One row beyond the cap was requested purely to detect the cap biting.
+	ledgerTruncated := ledgerFetched > rowLimit
+	if ledgerTruncated {
+		ledger = ledger[:rowLimit]
 	}
 
 	matched, discrepancies := reconcile.Match(rows, ledger, opts)
 
-	unreconcilable, unreconcilableTruncated, err := loadUnreconcilable(
-		ctx, tx, start, end, opts.UnreconcilableLimit())
+	unreconcilable, examined, err := loadUnreconcilable(ctx, tx, start, end, rowLimit)
 	if err != nil {
 		return nil, err
 	}
+	unreconcilableTruncated := examined > rowLimit
 
 	// Rollback rather than commit: nothing was written, and the snapshot has
 	// served its purpose.
@@ -116,16 +124,16 @@ func (s *Store) Reconcile(
 			Kind: reconcile.KindLedgerTruncated,
 			Details: map[string]any{
 				"reason":     "the statement window holds more transactions than one comparison loads",
-				"max_loaded": opts.LedgerRowsLimit(),
+				"max_loaded": rowLimit,
 			},
 		})
 	}
 	if unreconcilableTruncated {
 		all = append(all, reconcile.Discrepancy{
-			Kind: reconcile.KindLedgerTruncated,
+			Kind: reconcile.KindUnreconcilableTruncated,
 			Details: map[string]any{
-				"reason":     "the statement window holds more unreconcilable transactions than one run lists",
-				"max_loaded": opts.UnreconcilableLimit(),
+				"reason":     "the integrity scan examined only the start of the statement window",
+				"max_loaded": rowLimit,
 			},
 		})
 	}
@@ -152,9 +160,9 @@ func (s *Store) Reconcile(
 // posted just outside the statement's range can still be matched to a row
 // inside it, rather than being reported missing on both sides.
 func loadLedgerWindow(ctx context.Context, tx pgx.Tx, start, end *time.Time,
-	tolerance time.Duration, maxRows int) ([]reconcile.LedgerTransaction, bool, error) {
+	tolerance time.Duration, maxRows int) ([]reconcile.LedgerTransaction, int, error) {
 	if start == nil || end == nil {
-		return nil, false, nil
+		return nil, 0, nil
 	}
 	if tolerance <= 0 {
 		tolerance = reconcile.DefaultDateTolerance
@@ -182,7 +190,7 @@ func loadLedgerWindow(ctx context.Context, tx pgx.Tx, start, end *time.Time,
 		 LIMIT $4`,
 		start.UTC(), end.UTC(), intervalOf(tolerance), maxRows+1)
 	if err != nil {
-		return nil, false, fmt.Errorf("load ledger window: %w", err)
+		return nil, 0, fmt.Errorf("load ledger window: %w", err)
 	}
 	defer rows.Close()
 
@@ -191,56 +199,70 @@ func loadLedgerWindow(ctx context.Context, tx pgx.Tx, start, end *time.Time,
 		var t reconcile.LedgerTransaction
 		if err := rows.Scan(&t.ID, &t.ExternalRef, &t.PostedAt,
 			&t.DebitAccountID, &t.CreditAccountID, &t.Amount, &t.Currency); err != nil {
-			return nil, false, fmt.Errorf("scan ledger transaction: %w", err)
+			return nil, 0, fmt.Errorf("scan ledger transaction: %w", err)
 		}
 		out = append(out, t)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, false, fmt.Errorf("read ledger window: %w", err)
+		return nil, 0, fmt.Errorf("read ledger window: %w", err)
 	}
 
-	// One row beyond the limit was requested purely to detect the limit biting.
-	if len(out) > maxRows {
-		return out[:maxRows], true, nil
-	}
-	return out, false, nil
+	// The fetched count is returned rather than folded into a bool because it is
+	// the only evidence that the SQL LIMIT is doing anything. Truncating here as
+	// well would make a missing LIMIT invisible: the caller would slice to the
+	// same rows either way, and the bound would be untestable -- which is
+	// precisely how it went untested before.
+	return out, len(out), nil
 }
 
 // loadUnreconcilable finds transactions in the window that the statement format
 // cannot describe, so they can be reported instead of silently skipped by the
 // two-leg restriction in loadLedgerWindow.
+//
+// The window's transactions are limited BEFORE the leg count is computed, and
+// the count is a correlated subquery per transaction rather than an aggregate
+// over a join. This is not a stylistic choice. The previous form put a LIMIT
+// above `GROUP BY t.id HAVING COUNT(e.id) <> 2`, which bounds rows returned and
+// not work done: on a healthy ledger the HAVING rejects every group, so the
+// aggregate ran to completion over the whole window before the LIMIT could see
+// anything. Measured over 400k entries in a 366-day window -- reachable from a
+// two-row CSV -- that cost 440ms and returned nothing, worse than the
+// whole-ledger drift query this file removed for being too expensive.
+//
+// Restricting first turns it into an index scan over the capped set plus one
+// index-only probe per transaction: 5ms at the cap a two-row upload earns.
 func loadUnreconcilable(ctx context.Context, tx pgx.Tx, start, end *time.Time,
-	maxRows int) ([]reconcile.Discrepancy, bool, error) {
+	maxRows int) ([]reconcile.Discrepancy, int, error) {
 	if start == nil || end == nil {
-		return nil, false, nil
+		return nil, 0, nil
 	}
 	if maxRows <= 0 {
-		maxRows = reconcile.MaxUnreconcilableRows
+		maxRows = reconcile.MinLedgerWindowRows
 	}
 
-	// LIMIT one past the cap, so a full page is distinguishable from a page that
-	// merely happened to land on it.
 	rows, err := tx.Query(ctx, `
-		SELECT t.id, t.currency, t.created_at, COUNT(e.id) AS legs
-		  FROM transactions t
-		  -- LEFT JOIN: the zero-sum trigger permits a transaction with no legs
-		  -- at all, and an inner join would make those invisible to the very
-		  -- check that exists so nothing is silently excluded.
-		  LEFT JOIN ledger_entries e ON e.transaction_id = t.id
-		 WHERE t.created_at BETWEEN $1 AND $2
-		 GROUP BY t.id, t.currency, t.created_at
-		HAVING COUNT(e.id) <> 2
-		 ORDER BY t.created_at, t.id
-		 LIMIT $3`, start.UTC(), end.UTC(), maxRows+1)
+		SELECT q.id, q.currency, q.created_at, q.legs
+		  FROM (SELECT w.id,
+		               w.currency,
+		               w.created_at,
+		               -- Correlated, so each transaction is one index-only probe.
+		               -- A LEFT JOIN here would hash the whole entries table.
+		               (SELECT COUNT(*)
+		                  FROM ledger_entries e
+		                 WHERE e.transaction_id = w.id) AS legs
+		          FROM (SELECT t.id, t.currency, t.created_at
+		                  FROM transactions t
+		                 WHERE t.created_at BETWEEN $1 AND $2
+		                 ORDER BY t.created_at, t.id
+		                 LIMIT $3) w) q
+		 WHERE q.legs <> 2
+		 ORDER BY q.created_at, q.id`, start.UTC(), end.UTC(), maxRows)
 	if err != nil {
-		return nil, false, fmt.Errorf("load unreconcilable transactions: %w", err)
+		return nil, 0, fmt.Errorf("load unreconcilable transactions: %w", err)
 	}
 	defer rows.Close()
 
-	var (
-		out       []reconcile.Discrepancy
-		truncated bool
-	)
+	var out []reconcile.Discrepancy
 	for rows.Next() {
 		var (
 			id       uuid.UUID
@@ -249,11 +271,7 @@ func loadUnreconcilable(ctx context.Context, tx pgx.Tx, start, end *time.Time,
 			legs     int
 		)
 		if err := rows.Scan(&id, &currency, &postedAt, &legs); err != nil {
-			return nil, false, fmt.Errorf("scan unreconcilable transaction: %w", err)
-		}
-		if len(out) == maxRows {
-			truncated = true
-			break
+			return nil, 0, fmt.Errorf("scan unreconcilable transaction: %w", err)
 		}
 		txID := id
 		out = append(out, reconcile.Discrepancy{
@@ -268,9 +286,30 @@ func loadUnreconcilable(ctx context.Context, tx pgx.Tx, start, end *time.Time,
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, false, fmt.Errorf("read unreconcilable transactions: %w", err)
+		return nil, 0, fmt.Errorf("read unreconcilable transactions: %w", err)
 	}
-	return out, truncated, nil
+	rows.Close()
+
+	// Whether the cap bit cannot be read off the rows above: the leg filter
+	// removes almost all of them, and on a healthy ledger it removes every one.
+	// So ask separately, one row past the cap -- a bounded index scan, and the
+	// only way to avoid reporting a partial scan as a complete one. Keeping the
+	// probe out of the query above matters: a findings query that read
+	// maxRows+1 would report a finding from a transaction it was capped short
+	// of examining.
+	var examined int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		  FROM (SELECT 1
+		          FROM transactions t
+		         WHERE t.created_at BETWEEN $1 AND $2
+		         ORDER BY t.created_at, t.id
+		         LIMIT $3) capped`,
+		start.UTC(), end.UTC(), maxRows+1).Scan(&examined); err != nil {
+		return nil, 0, fmt.Errorf("count unreconcilable scan window: %w", err)
+	}
+
+	return out, examined, nil
 }
 
 // saveRun persists the run and its discrepancies in one transaction, so a report

@@ -8,10 +8,39 @@ import (
 	"github.com/google/uuid"
 )
 
+// BalanceDrift is an account whose cached balance disagrees with the sum of its
+// entries. It lives here rather than with the matcher because matching does not
+// produce drift: only the sweep does.
+type BalanceDrift struct {
+	AccountID uuid.UUID
+	Name      string
+	Cached    int64
+	Derived   int64
+}
+
+// DriftDiscrepancies turns balance drift findings into discrepancies.
+func DriftDiscrepancies(drifts []BalanceDrift) []Discrepancy {
+	out := make([]Discrepancy, 0, len(drifts))
+	for _, d := range drifts {
+		out = append(out, Discrepancy{
+			Kind: KindBalanceDrift,
+			Details: map[string]any{
+				"account_id":      d.AccountID,
+				"account_name":    d.Name,
+				"cached_balance":  d.Cached,
+				"derived_balance": d.Derived,
+				"difference":      d.Cached - d.Derived,
+			},
+		})
+	}
+	return out
+}
+
 // DriftScanner reads accounts and their derived balances one bounded page at a
-// time.
+// time. A nil cursor starts the sweep: nil rather than the zero uuid so that an
+// account whose id happened to be all zeroes would still be swept.
 type DriftScanner interface {
-	ScanDriftPage(ctx context.Context, after uuid.UUID, limit int) (DriftPage, error)
+	ScanDriftPage(ctx context.Context, after *uuid.UUID, limit int) (DriftPage, error)
 }
 
 // DriftPage is one page of the accounts table checked against its entries.
@@ -71,12 +100,12 @@ func SweepDrift(ctx context.Context, scanner DriftScanner, pageSize int) (DriftS
 
 	var (
 		sweep DriftSweep
-		after uuid.UUID
+		after *uuid.UUID
 	)
 	for {
 		page, err := scanner.ScanDriftPage(ctx, after, pageSize)
 		if err != nil {
-			return sweep, fmt.Errorf("scan drift page after %s: %w", after, err)
+			return sweep, fmt.Errorf("scan drift page after %v: %w", after, err)
 		}
 		if page.Scanned == 0 {
 			return sweep, nil
@@ -84,7 +113,7 @@ func SweepDrift(ctx context.Context, scanner DriftScanner, pageSize int) (DriftS
 		// A cursor that does not advance would loop forever. A keyset query
 		// cannot produce one, which is the reason to fail loudly here rather
 		// than discover it as a job that never ends.
-		if bytes.Compare(page.LastID[:], after[:]) <= 0 {
+		if after != nil && bytes.Compare(page.LastID[:], after[:]) <= 0 {
 			return sweep, fmt.Errorf("drift sweep cursor did not advance past %s", after)
 		}
 
@@ -102,7 +131,8 @@ func SweepDrift(ctx context.Context, scanner DriftScanner, pageSize int) (DriftS
 		if page.Scanned < pageSize {
 			return sweep, nil
 		}
-		after = page.LastID
+		last := page.LastID
+		after = &last
 	}
 }
 

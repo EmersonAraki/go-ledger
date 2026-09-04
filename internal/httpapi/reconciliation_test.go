@@ -308,6 +308,10 @@ func TestUploadNeverSweepsForBalanceDrift(t *testing.T) {
 // 80-byte upload aggregated every entry ever written, on an endpoint with no
 // authentication. Every query on this path is now gated on a window the file
 // itself must supply; with no rows there is no window, and nothing runs.
+//
+// "Nothing runs" is asserted rather than described: a ledger transaction that
+// any window-driven query would have found is present, and the run must still
+// come back empty and clean.
 func TestHeaderOnlyStatementDoesNoLedgerWork(t *testing.T) {
 	t.Parallel()
 	api := newTestAPI(t)
@@ -317,10 +321,12 @@ func TestHeaderOnlyStatementDoesNoLedgerWork(t *testing.T) {
 	api.fund(alice, "BRL", 1000)
 	api.postTransfer(bob, alice, 300)
 
-	// Corrupt a balance. A run that swept the whole ledger would find it.
+	// A transaction the ledger-window query would report as missing_in_statement
+	// the moment it ran at all, and one the integrity scan would report as
+	// unreconcilable. If either query runs, this test fails.
 	if _, err := api.pool.Exec(context.Background(),
-		`UPDATE accounts SET balance = balance + 99 WHERE id = $1`, bob); err != nil {
-		t.Fatalf("corrupt balance: %v", err)
+		`INSERT INTO transactions (id, currency) VALUES (gen_random_uuid(), 'BRL')`); err != nil {
+		t.Fatalf("insert legless transaction: %v", err)
 	}
 
 	rec := api.uploadStatement("empty.csv", csvHeader)
@@ -336,6 +342,9 @@ func TestHeaderOnlyStatementDoesNoLedgerWork(t *testing.T) {
 	}
 	if !run.Clean {
 		t.Errorf("an empty statement produced findings: %v", run.kinds())
+	}
+	if len(run.Discrepancies) != 0 {
+		t.Errorf("a header-only statement ran a ledger query: %v", run.kinds())
 	}
 }
 

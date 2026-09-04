@@ -3,6 +3,7 @@ package reconcile_test
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
@@ -22,12 +23,12 @@ type fakeScanner struct {
 	stuck bool
 }
 
-func (f *fakeScanner) ScanDriftPage(_ context.Context, after uuid.UUID, limit int) (reconcile.DriftPage, error) {
+func (f *fakeScanner) ScanDriftPage(_ context.Context, after *uuid.UUID, limit int) (reconcile.DriftPage, error) {
 	f.calls++
 
 	var page reconcile.DriftPage
 	for _, a := range f.accounts {
-		if a.AccountID.String() <= after.String() {
+		if after != nil && a.AccountID.String() <= after.String() {
 			continue
 		}
 		page.Scanned++
@@ -39,8 +40,8 @@ func (f *fakeScanner) ScanDriftPage(_ context.Context, after uuid.UUID, limit in
 			break
 		}
 	}
-	if f.stuck {
-		page.LastID = after
+	if f.stuck && after != nil {
+		page.LastID = *after
 	}
 	return page, nil
 }
@@ -205,5 +206,72 @@ func TestDriftRunRecordsTruncation(t *testing.T) {
 	}
 	if run.MatchedCount != 7 {
 		t.Errorf("matched = %d, want 7 (9 scanned, 2 drifting)", run.MatchedCount)
+	}
+}
+
+// The caller-supplied limits may only lower the computed caps, never raise them.
+// They exist so tests can reach the boundaries; a caller that could raise them
+// would be a caller that could remove the bounds these limits are.
+func TestOptionsCannotRaiseTheLimits(t *testing.T) {
+	t.Parallel()
+
+	opts := reconcile.Options{
+		MaxFindings:   reconcile.MaxFindings * 10,
+		MaxLedgerRows: reconcile.MaxLedgerWindowRows * 10,
+	}
+	if got := opts.FindingsLimit(); got != reconcile.MaxFindings {
+		t.Errorf("FindingsLimit = %d, want it clamped to %d", got, reconcile.MaxFindings)
+	}
+	// A huge statement earns the ceiling; the option must not lift it further.
+	if got := opts.LedgerRowsLimit(reconcile.MaxLedgerWindowRows); got != reconcile.MaxLedgerWindowRows {
+		t.Errorf("LedgerRowsLimit = %d, want it clamped to %d",
+			got, reconcile.MaxLedgerWindowRows)
+	}
+}
+
+// LedgerRowsLimit is what Reconcile actually calls, so it -- not just the
+// underlying LedgerRowsFor -- has to track the upload. Asserting only on
+// LedgerRowsFor left the accessor free to return the ceiling and no test noticed.
+func TestLedgerRowsLimitTracksTheUpload(t *testing.T) {
+	t.Parallel()
+
+	var opts reconcile.Options
+	for _, rows := range []int{0, 1, 2, 50} {
+		got := opts.LedgerRowsLimit(rows)
+		if want := reconcile.LedgerRowsFor(rows); got != want {
+			t.Errorf("LedgerRowsLimit(%d) = %d, want %d", rows, got, want)
+		}
+		if got >= reconcile.MaxLedgerWindowRows {
+			t.Errorf("LedgerRowsLimit(%d) = %d, at or above the ceiling %d -- a small "+
+				"upload is buying a ledger-sized scan", rows, got, reconcile.MaxLedgerWindowRows)
+		}
+	}
+}
+
+// The ledger row cap must be a function of the upload. A constant sized off the
+// ledger is not a bound -- it is a bigger ledger's problem deferred.
+func TestLedgerRowsForScalesWithTheUpload(t *testing.T) {
+	t.Parallel()
+
+	small := reconcile.LedgerRowsFor(2)
+	large := reconcile.LedgerRowsFor(2_000)
+	if small >= large {
+		t.Errorf("LedgerRowsFor(2) = %d is not below LedgerRowsFor(2000) = %d; "+
+			"the cap does not track the upload", small, large)
+	}
+	if small != reconcile.MinLedgerWindowRows+2*reconcile.LedgerRowsPerStatementRow {
+		t.Errorf("LedgerRowsFor(2) = %d, want floor %d plus two rows' allowance",
+			small, reconcile.MinLedgerWindowRows)
+	}
+	// The ceiling still holds, including against an overflow-sized row count.
+	for _, n := range []int{reconcile.MaxLedgerWindowRows, 1 << 40, math.MaxInt} {
+		if got := reconcile.LedgerRowsFor(n); got != reconcile.MaxLedgerWindowRows {
+			t.Errorf("LedgerRowsFor(%d) = %d, want the ceiling %d",
+				n, got, reconcile.MaxLedgerWindowRows)
+		}
+	}
+	// A header-only statement still gets the floor, never a negative cap.
+	if got := reconcile.LedgerRowsFor(0); got != reconcile.MinLedgerWindowRows {
+		t.Errorf("LedgerRowsFor(0) = %d, want the floor %d", got, reconcile.MinLedgerWindowRows)
 	}
 }

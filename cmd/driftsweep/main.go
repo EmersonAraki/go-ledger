@@ -55,11 +55,11 @@ func run() (bool, error) {
 
 	store := postgres.NewStore(pool)
 
-	run, err := store.SweepBalanceDrift(ctx, reconcile.DefaultDriftPageSize)
+	report, err := store.SweepBalanceDrift(ctx, reconcile.DefaultDriftPageSize)
 	if err != nil {
 		return false, err
 	}
-	if run == nil {
+	if report == nil {
 		slog.InfoContext(ctx, "balance drift sweep clean")
 		return false, nil
 	}
@@ -67,7 +67,7 @@ func run() (bool, error) {
 	// Log every drifting account, not just the count: the run is persisted and
 	// readable over the API, but an operator woken by this needs the accounts.
 	drifted := 0
-	for _, d := range run.Discrepancies {
+	for _, d := range report.Discrepancies {
 		if d.Kind != reconcile.KindBalanceDrift {
 			continue
 		}
@@ -80,7 +80,7 @@ func run() (bool, error) {
 			"difference", d.Details["difference"])
 	}
 	slog.ErrorContext(ctx, "balance drift sweep found drift",
-		"run_id", run.ID, "accounts_checked", run.StatementRows,
+		"run_id", report.ID, "accounts_checked", report.StatementRows,
 		"accounts_drifted", drifted)
 	return true, nil
 }

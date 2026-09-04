@@ -59,6 +59,14 @@ const (
 	// dashboard filtering on one should not silently catch the other.
 	KindFindingsTruncated = "findings_truncated"
 
+	// KindUnreconcilableTruncated means the integrity scan examined only part of
+	// the window, so a malformed transaction beyond that point was not looked
+	// for. A distinct kind rather than a reason string on KindLedgerTruncated:
+	// "the comparison is partial" and "the integrity scan is partial" are
+	// different facts, and a client filtering on one should not have to parse
+	// prose to avoid catching the other.
+	KindUnreconcilableTruncated = "unreconcilable_truncated"
+
 	// KindLedgerTruncated means the ledger window held more transactions than one
 	// comparison will load, so the comparison is partial.
 	KindLedgerTruncated = "ledger_truncated"
@@ -91,11 +99,18 @@ const (
 // far larger than the bytes that produced it. A 32 MiB body of empty comma-only
 // lines expands into hundreds of megabytes of retained heap, and there is no
 // per-client limit on this endpoint. These caps bound the parsing and the
-// reporting. They do NOT by themselves bound the database side: that is bounded
-// separately, by MaxWindowDays, MaxLedgerWindowRows and MaxUnreconcilableRows.
-// Every query this job runs needs its own bound; capping the upload does nothing
-// for a query whose cost scales with the ledger. A check that cannot be bounded
-// that way does not belong on this path at all -- see cmd/driftsweep.
+// reporting. The database side needs its own bounds, and they must be
+// expressible in terms of the upload -- a constant sized off the ledger is not a
+// bound, it is a bigger ledger's problem deferred. MaxWindowDays caps the span;
+// LedgerRowsFor derives the row cap from the number of statement rows actually
+// read, so a two-row CSV pays for two rows' worth of ledger rather than for
+// whatever the window happens to contain.
+//
+// A bound must also bound the WORK, not merely the rows returned. A LIMIT above
+// an aggregate that filters everything out does neither: the aggregate still
+// runs to completion. Every query on this path therefore restricts the set it
+// aggregates before aggregating it. A check that cannot be bounded this way does
+// not belong on this path at all -- see cmd/driftsweep.
 const (
 	// MaxStatementRows is the most data rows read from one statement.
 	MaxStatementRows = 100_000
@@ -116,17 +131,19 @@ const (
 	// a statement.
 	MaxWindowDays = 366
 
-	// MaxLedgerWindowRows bounds how much ledger is pulled into memory for one
-	// comparison, whatever the window turns out to contain.
+	// MaxLedgerWindowRows is the ceiling on how much ledger one comparison pulls
+	// into memory. It is the last line of defence, not the working bound:
+	// LedgerRowsFor is almost always far below it.
 	MaxLedgerWindowRows = 200_000
 
-	// MaxUnreconcilableRows bounds the integrity scan over the same window.
-	// Unlike the comparison it feeds, this one is not proportional to the
-	// upload: a window holding a million malformed transactions would return a
-	// million rows from a one-line CSV. It is deliberately far smaller than
-	// MaxLedgerWindowRows, because a healthy ledger produces none of these and a
-	// ledger producing ten thousand has one problem, not ten thousand.
-	MaxUnreconcilableRows = 10_000
+	// LedgerRowsPerStatementRow and MinLedgerWindowRows shape the working bound.
+	//
+	// The allowance per statement row is generous because a run has to see more
+	// ledger than the statement mentions to be useful at all -- that is how
+	// missing_in_statement is found. The floor keeps a one-row upload from
+	// reporting a truncated window for a ledger that is nearly empty.
+	LedgerRowsPerStatementRow = 100
+	MinLedgerWindowRows       = 1_000
 
 	// MaxReportedParseErrors is the most individual unparseable-row findings
 	// collected. Beyond it the remainder are counted, not listed: a file that is
@@ -183,3 +200,22 @@ func stringPtr(s string) *string {
 }
 
 func uuidPtr(id uuid.UUID) *uuid.UUID { return &id }
+
+// LedgerRowsFor is the row cap for one run, derived from the statement rows
+// actually read. This is the bound the plan requires: expressible in terms of
+// the upload, so the cost of a request tracks the size of the file rather than
+// the size of the database.
+//
+// Both window queries share it. A run that examined the first N transactions of
+// a window did so for the comparison and for the integrity scan alike, and two
+// different caps would only make the report harder to reason about.
+func LedgerRowsFor(statementRows int) int {
+	if statementRows < 0 {
+		statementRows = 0
+	}
+	// Guard the multiplication before it can overflow on a hostile row count.
+	if statementRows > MaxLedgerWindowRows {
+		return MaxLedgerWindowRows
+	}
+	return min(LedgerRowsPerStatementRow*statementRows+MinLedgerWindowRows, MaxLedgerWindowRows)
+}
