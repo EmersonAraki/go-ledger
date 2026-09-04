@@ -265,7 +265,8 @@ func TestReconcileNeverModifiesTheLedger(t *testing.T) {
 	assertLedgerSumsToZero(t, api)
 }
 
-// The drift check is what keeps the cached balance honest.
+// The drift check is what keeps the cached balance honest. It is scoped to the
+// accounts the run examined, so the statement must actually cover them.
 func TestReconcileDetectsBalanceDrift(t *testing.T) {
 	t.Parallel()
 	api := newTestAPI(t)
@@ -273,7 +274,7 @@ func TestReconcileDetectsBalanceDrift(t *testing.T) {
 	alice := api.createAccount("alice", "BRL", false)
 	bob := api.createAccount("bob", "BRL", false)
 	api.fund(alice, "BRL", 1000)
-	api.postTransfer(bob, alice, 300)
+	txID := api.postTransferWithRef(bob, alice, 300, "TRX-1")
 
 	// Corrupt the cache behind the service's back, exactly as a bug elsewhere
 	// would. SUM(signed_amount) is unchanged and remains the truth.
@@ -282,7 +283,10 @@ func TestReconcileDetectsBalanceDrift(t *testing.T) {
 		t.Fatalf("corrupt balance: %v", err)
 	}
 
-	rec := api.uploadStatement("empty.csv", csvHeader)
+	csv := csvHeader + fmt.Sprintf("TRX-1,%s,%s,%s,300,BRL\n",
+		api.postedAt(txID).Format(time.RFC3339), bob, alice)
+
+	rec := api.uploadStatement("drift.csv", csv)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("upload: status %d, body %s", rec.Code, rec.Body)
 	}
@@ -310,6 +314,45 @@ func TestReconcileDetectsBalanceDrift(t *testing.T) {
 	}
 	if diff, _ := drift.Details["difference"].(float64); diff != 42 {
 		t.Errorf("difference = %v, want 42", diff)
+	}
+}
+
+// A statement with no rows must not make the server sweep the ledger. This was a
+// real hole: the drift check had no window predicate and no limit, so a
+// header-only 80-byte upload aggregated every entry ever written, on an endpoint
+// with no authentication. A run with nothing to reconcile must do no work.
+func TestHeaderOnlyStatementDoesNoLedgerWork(t *testing.T) {
+	t.Parallel()
+	api := newTestAPI(t)
+
+	alice := api.createAccount("alice", "BRL", false)
+	bob := api.createAccount("bob", "BRL", false)
+	api.fund(alice, "BRL", 1000)
+	api.postTransfer(bob, alice, 300)
+
+	// Corrupt a balance. A run that swept the whole ledger would find it.
+	if _, err := api.pool.Exec(context.Background(),
+		`UPDATE accounts SET balance = balance + 99 WHERE id = $1`, bob); err != nil {
+		t.Fatalf("corrupt balance: %v", err)
+	}
+
+	rec := api.uploadStatement("empty.csv", csvHeader)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("upload: status %d, body %s", rec.Code, rec.Body)
+	}
+
+	var run runBody
+	api.decode(rec, &run)
+
+	if run.StatementRows != 0 {
+		t.Errorf("statement_rows = %d, want 0", run.StatementRows)
+	}
+	if got := run.kinds()[reconcile.KindBalanceDrift]; got != 0 {
+		t.Errorf("balance_drift = %d, want 0 -- an empty statement swept the ledger "+
+			"(kinds: %v)", got, run.kinds())
+	}
+	if !run.Clean {
+		t.Errorf("an empty statement produced findings: %v", run.kinds())
 	}
 }
 

@@ -35,12 +35,36 @@ const DefaultDateTolerance = 24 * time.Hour
 
 // Options tunes matching.
 type Options struct {
+	// MaxFindings and MaxLedgerRows override the package defaults when non-zero.
+	// They exist as options rather than bare constants so a test can drive the
+	// boundaries: a limit only reachable by uploading a hundred thousand rows is
+	// a limit nothing ever exercises, and untested limits are how the earlier
+	// rounds of defects in this file survived.
+	MaxFindings   int
+	MaxLedgerRows int
+
 	// DateTolerance overrides DefaultDateTolerance when non-zero. It governs
 	// both how far a referenced pair's dates may differ and how far apart a
 	// heuristic pairing may be -- deliberately one knob, because the caller
 	// loads the ledger window using this same value, and a separate heuristic
 	// window could search a range that was never loaded.
 	DateTolerance time.Duration
+}
+
+// FindingsLimit is the effective cap on reported statement findings.
+func (o Options) FindingsLimit() int {
+	if o.MaxFindings > 0 {
+		return o.MaxFindings
+	}
+	return MaxFindings
+}
+
+// LedgerRowsLimit is the effective cap on ledger rows loaded for one comparison.
+func (o Options) LedgerRowsLimit() int {
+	if o.MaxLedgerRows > 0 {
+		return o.MaxLedgerRows
+	}
+	return MaxLedgerWindowRows
 }
 
 func (o Options) dateTolerance() time.Duration {

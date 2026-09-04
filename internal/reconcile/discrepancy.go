@@ -53,6 +53,12 @@ const (
 	// movements that merely look alike are the same one.
 	KindProbableMatch = "probable_match"
 
+	// KindFindingsTruncated means there were more findings than one report lists.
+	// Distinct from KindStatementTruncated: "we did not read all of your file"
+	// and "we did not list all of our findings" are different facts, and a
+	// dashboard filtering on one should not silently catch the other.
+	KindFindingsTruncated = "findings_truncated"
+
 	// KindLedgerTruncated means the ledger window held more transactions than one
 	// comparison will load, so the comparison is partial.
 	KindLedgerTruncated = "ledger_truncated"
@@ -83,8 +89,12 @@ const (
 // input: an unbounded file yields unbounded slices of rows and findings, each
 // far larger than the bytes that produced it. A 32 MiB body of empty comma-only
 // lines expands into hundreds of megabytes of retained heap, and there is no
-// per-client limit on this endpoint. These caps bound the work a single upload
-// can cause.
+// per-client limit on this endpoint. These caps bound the parsing and the
+// reporting. They do NOT by themselves bound the database side: that is bounded
+// separately, by MaxWindowDays and MaxLedgerWindowRows and by scoping the drift
+// check to the statement's window. Every query this job runs needs its own
+// bound; capping the upload does nothing for a query whose cost scales with the
+// ledger.
 const (
 	// MaxStatementRows is the most data rows read from one statement.
 	MaxStatementRows = 100_000
